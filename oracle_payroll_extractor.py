@@ -108,7 +108,10 @@ def is_val(text):
     return ("." in s_text or "٫" in s_text) or len(digits) <= 7
 
 def is_ignored_item(clean_text):
-    """استبعاد العناوين والإجماليات وصافي الراتب من قائمة البنود"""
+    """استبعاد العناوين والإجماليات والمجاميع الفرعية وصافي الراتب من قائمة البنود"""
+    # استبعاد البنود التجميعية التي تبدأ بـ x لأنها مجاميع فرعية لبنود موجودة بالفعل في الجدول وتتسبب في مضاعفة المبالغ
+    if clean_text.strip().lower().startswith("x"):
+        return True
     norm = normalize(clean_text)
     ignore_keywords = [
         "اجمالي", "إجمالي", "اجمالى", "إجمالى", "صافي", "صافى", 
@@ -446,21 +449,33 @@ class SmartPayrollApp:
             self.combo_item.config(state="disabled")
 
     def get_unified_employees(self, pages_data):
-        """توحيد بيانات الموظف إذا كان يمتلك أكثر من صفحة في ملف الرواتب"""
-        emps = {}
+        """
+        توحيد بيانات الموظف:
+        1. دمج الصفحات الممتدة (Continuation Pages) التي لا تحتوي على ترويسة إلى الموظف السابق لها مباشرة.
+        2. دمج أي تكرار لنفس كود الموظف.
+        """
+        emps = []
+        curr_emp = None
         for pg in pages_data:
-            code = str(pg.get("code", "")).strip()
-            name = str(pg.get("name", "")).strip()
-            key = (code, name) if (code or name) else id(pg)
-            if key not in emps:
-                emps[key] = {
-                    "code": code,
-                    "name": name,
+            is_cont = (pg.get("name") == UNKNOWN and pg.get("code") == UNKNOWN)
+            if not is_cont:
+                curr_emp = {
+                    "code": str(pg.get("code", "")).strip(),
+                    "name": str(pg.get("name", "")).strip(),
                     "items": dict(pg.get("items", {}))
                 }
+                emps.append(curr_emp)
             else:
-                emps[key]["items"].update(pg.get("items", {}))
-        return list(emps.values())
+                if curr_emp is not None:
+                    curr_emp["items"].update(pg.get("items", {}))
+                else:
+                    curr_emp = {
+                        "code": UNKNOWN,
+                        "name": UNKNOWN,
+                        "items": dict(pg.get("items", {}))
+                    }
+                    emps.append(curr_emp)
+        return emps
 
     def fix_ar(self, t):
         if not t: return ""
@@ -679,6 +694,11 @@ class SmartPayrollApp:
                 self._save_comprehensive_excel(f, info["data"], info["ent_items"], info["ded_items"], pdf_name)
             
             messagebox.showinfo("نجاح التصدير", f"تم تصدير ملف الإكسيل وتنسيقه باحترافية عالية:\n{os.path.basename(f)}")
+        except PermissionError:
+            messagebox.showerror(
+                "الملف مفتوح حالياً",
+                f"تعذر حفظ الملف لأن الملف مفتوح حالياً في برنامج آخر (مثل Excel):\n{os.path.basename(f)}\n\nيرجى إغلاق الملف في Excel ثم إعادة الضغط على تصدير."
+            )
         except Exception as e:
             messagebox.showerror("خطأ في التصدير", f"حدث خطأ أثناء تصدير الملف:\n{str(e)}")
 
