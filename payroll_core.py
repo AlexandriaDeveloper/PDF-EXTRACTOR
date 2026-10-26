@@ -303,6 +303,7 @@ def _parse_employee(pages: list[tuple[int, str]]) -> PayrollEmployee:
     pending: str | None = None
     pending_page = 0
     official: dict[str, Decimal] = {}
+    unclassified: list[PayrollEntry] = []
     for (page_num, _), lines in zip(pages, source_lines):
         for line in lines:
             summary = _summary_kind(line)
@@ -338,6 +339,13 @@ def _parse_employee(pages: list[tuple[int, str]]) -> PayrollEmployee:
                 state = heading
                 continue
             if not started:
+                continue
+            if "[قسم غير مؤكد]" in line:
+                candidate = _entry_from_text(line.replace(" [قسم غير مؤكد]", ""), "Earning", page_num)
+                if candidate is None:
+                    employee.warnings.append(f"سطر تكميلي غير قابل للتوثيق بالصفحة {page_num}")
+                else:
+                    unclassified.append(candidate)
                 continue
             if _metadata_line(line):
                 if pending:
@@ -407,6 +415,21 @@ def _parse_employee(pages: list[tuple[int, str]]) -> PayrollEmployee:
     employee.gross = official.get("gross")
     employee.deductions = official.get("deductions")
     employee.net = official.get("net")
+    if unclassified:
+        already_confirmed = sum((e.amount for e in employee.entries if e.kind == "Earning"), Decimal(0))
+        conditional_total = already_confirmed + sum((e.amount for e in unclassified), Decimal(0))
+        # A continuation row is only assigned to earnings when ALL uncertain
+        # rows jointly match the independent, officially printed earnings total.
+        # Otherwise retain them as unresolved; don't classify by code prefix.
+        if (employee.gross is not None and
+            abs(conditional_total - employee.gross) <= Decimal("0.02") and
+            abs(already_confirmed - employee.gross) > Decimal("0.02")):
+            employee.entries.extend(unclassified)
+            employee.warnings.append(
+                f"{len(unclassified)} بنود استحقاق من صفحات تكميلية صُنفت بمطابقة إجمالي Oracle؛ راجع مصادرها")
+        else:
+            employee.warnings.append(
+                f"{len(unclassified)} بنود مالية إضافية لا يمكن إثبات قسمها من مصدر Oracle")
     for name, value in (("الاستحقاقات", employee.gross),
                         ("الاستقطاعات", employee.deductions),
                         ("الصافي", employee.net)):
