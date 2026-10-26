@@ -8,8 +8,8 @@ permissions:
   contents: read
 jobs:
   tests:
-    name: Python on \${{ matrix.os }}
-    runs-on: \${{ matrix.os }}
+    name: Python on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
