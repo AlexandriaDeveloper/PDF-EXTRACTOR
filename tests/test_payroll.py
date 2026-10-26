@@ -5,7 +5,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from openpyxl import load_workbook
-from payroll_core import import_page_texts, key, number, _parse_employee
+from payroll_core import import_page_texts, import_pdf, key, number, _parse_employee, _page_stream
 from payroll_export import ExportSelection, available_items, make_workbook, save_excel
 
 NID_A="00000000000001"
@@ -121,6 +121,52 @@ class ParserTests(unittest.TestCase):
         r=import_page_texts("empty.pdf",["نظام أوراكل للرواتب\nالاستحقاقات\n21110442 بدل 100.00"])
         self.assertFalse(r.verified)
         self.assertEqual(0,len(r.employees))
+
+
+class PdfSourceTests(unittest.TestCase):
+    def test_uses_structured_table_only_when_more_semantically_complete(self):
+        class Page:
+            def extract_text(self):
+                return "noise\nabcde"
+            def extract_tables(self):
+                return [[
+                    ["اسم الموظف: موظف تجريبي محمد علي رقم الصرف: 30200105-00001 الرقم القومي: 00000000000001"],
+                    ["الاستحقاقات"],
+                    ["21110442","بدل الجامعة","100.00"],
+                ]]
+        stream=_page_stream(Page())
+        self.assertIn("21110442",stream)
+        self.assertIn("الاستحقاقات",stream)
+
+    def test_pdf_smoke_reads_real_synthetic_pdf_binary(self):
+        # Construct a tiny non-sensitive PDF without third-party PDF generators.
+        contents=b"BT /F1 12 Tf 72 700 Td (PAYROLL SMOKE SAMPLE) Tj ET"
+        objects=[
+            b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+            b"<< /Length "+str(len(contents)).encode()+b" >>\nstream\n"+contents+b"\nendstream",
+        ]
+        data=bytearray(b"%PDF-1.4\n")
+        positions=[0]
+        for i,obj in enumerate(objects,1):
+            positions.append(len(data))
+            data.extend(f"{i} 0 obj\n".encode()+obj+b"\nendobj\n")
+        xref=len(data)
+        data.extend(f"xref\n0 {len(objects)+1}\n".encode())
+        data.extend(b"0000000000 65535 f \n")
+        for position in positions[1:]:
+            data.extend(f"{position:010d} 00000 n \n".encode())
+        data.extend(b"trailer\n<< /Size 6 /Root 1 0 R >>\n")
+        data.extend(f"startxref\n{xref}\n%%EOF\n".encode())
+        with tempfile.TemporaryDirectory() as d:
+            p=Path(d)/"fixture.pdf"
+            p.write_bytes(data)
+            report=import_pdf(p)
+            self.assertEqual(1,report.pages)
+            self.assertEqual([],report.employees)
+            self.assertFalse(report.verified)
 
 
 class ExcelTests(unittest.TestCase):
