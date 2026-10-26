@@ -49,10 +49,10 @@ python -m PyInstaller --noconfirm --clean OraclePayrollExtractor.spec
 ### التحقق المحلي على بياناتك الأصلية
 
 ```powershell
-python tools/verify_local.py "F:\path\to\real-payroll.pdf" --expect-employees 219 --expect-net 2864042.24
+python tools/verify_local.py "C:\\PRIVATE\\payroll.pdf" --strict
 ```
 
-القيم في المثال **ضوابط تخص مجموعة محددة فقط** وليست أرقامًا عامة لأي ملف. استخدم الضوابط المطابقة لكشفك. الأداة لا تطبع بيانات الموظفين، وتتيح `--strict` لرفض أي تحذير.
+لتطبيق ضوابطك الخاصة، استخدم `--expect-employees` و`--expect-net` بالقيم المرجعية التي راجعتها محليًا فقط. لا تُدخل أرقام ملفات الرواتب الحقيقية في المستودع العام. الأداة لا تطبع أسماء الموظفين أو أرقامهم.
 
 ## البنية
 
