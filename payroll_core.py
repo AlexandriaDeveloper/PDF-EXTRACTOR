@@ -460,6 +460,52 @@ def import_page_texts(filename: str, page_texts: list[str]) -> ImportReport:
     return ImportReport(filename, employees, len(page_texts), warnings)
 
 
+def _candidate_quality(text: str) -> int:
+    """Score semantic completeness, not horizontal PDF coordinates."""
+    lines = logical_lines(text)
+    score = 0
+    for line in lines:
+        if _header_present([line]):
+            score += 5
+        if _section_heading(line):
+            score += 5
+        if _summary_kind(line) and _amount_on_line(line) is not None:
+            score += 4
+        if _ACCOUNT.search(line) and _DECIMAL_NUM.search(line):
+            score += 3
+        if "رقم الصرف" in key(line) and _DISBURSEMENT.search(line):
+            score += 3
+    return score
+
+
+def _page_stream(page: object) -> str:
+    """Select between native text order and table order without double-counting.
+
+    Parsing *both* representations as separate detail records would duplicate
+    money. Instead select a single, semantically stronger representation.
+    """
+    text = page.extract_text() or ""
+    # Avoid expensive table extraction when a text page already has plausible
+    # Oracle sections or anchored financial lines.
+    text_score = _candidate_quality(text)
+    if text_score >= 14:
+        return text
+    try:
+        tables = page.extract_tables() or []
+    except (AttributeError, ValueError):
+        tables = []
+    table_lines: list[str] = []
+    for table in tables:
+        for row in table:
+            if not row:
+                continue
+            cells = [str(c).replace("\n", " ").strip() for c in row if c is not None and str(c).strip()]
+            if cells:
+                table_lines.append(" ".join(cells))
+    table_text = "\n".join(table_lines)
+    return table_text if _candidate_quality(table_text) > text_score else text
+
+
 def import_pdf(path: str | Path, progress: Callable[[int, int], None] | None = None) -> ImportReport:
     pdf_path = Path(path)
     text_pages: list[str] = []
@@ -467,15 +513,9 @@ def import_pdf(path: str | Path, progress: Callable[[int, int], None] | None = N
         total = len(pdf.pages)
         for ix, page in enumerate(pdf.pages, start=1):
             try:
-                # Table extraction remains a fallback, not an invitation to
-                # classify financial rows using left/right pixel positions.
-                text = page.extract_text() or ""
-                if not text.strip():
-                    tables = page.extract_tables() or []
-                    text = "\n".join(
-                        " ".join(str(c or "") for c in row)
-                        for table in tables for row in table)
-                text_pages.append(text)
+                # Pick one representation of each page to avoid duplicate
+                # financial entries. Never infer Earning/Deduction from columns.
+                text_pages.append(_page_stream(page))
             finally:
                 page.flush_cache()
             if progress:
