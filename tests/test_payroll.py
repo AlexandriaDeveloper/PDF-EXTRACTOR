@@ -160,6 +160,8 @@ class ExcelTests(unittest.TestCase):
         report=valid_report()
         e=report.employees[0]
         k=next(k for k,x in available_items(report).items() if x.kind=="Earning")
+        from payroll_core import PayrollEmployee
+        report.employees.append(PayrollEmployee(name="موظف وهمي",entries=list(e.entries)))
         e.entries=[v for v in e.entries if v.choice_key!=k]
         e.warnings.append("مصدر غير مؤكد")
         ws=make_workbook(report,ExportSelection(None,(k,),False,False,False)).active
@@ -176,12 +178,12 @@ class ExcelTests(unittest.TestCase):
     def test_distinguish_informational_and_deductions(self):
         r=valid_report()
         keys=available_items(r)
-        self.assertEqual(4,len(keys))
-        self.assertEqual(3,sum(v.kind=="Informational" for v in keys.values()))
+        self.assertEqual(6,len(keys))
+        self.assertEqual(4,sum(v.kind=="Informational" for v in keys.values()))
         # Distinct informational descriptions share an account code.
         shares=[v for v in r.employees[0].entries if v.kind=="Informational"]
         self.assertEqual(4,len(shares))
-        self.assertEqual(3,len({v.choice_key for v in shares}))
+        self.assertEqual(4,len({v.choice_key for v in shares}))
 
 
 if __name__=="__main__":
