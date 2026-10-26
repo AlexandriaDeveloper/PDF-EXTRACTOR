@@ -169,6 +169,51 @@ class PdfSourceTests(unittest.TestCase):
             self.assertFalse(report.verified)
 
 
+    def test_table_cells_restore_sections_totals_and_identity_without_duplicates(self):
+        from payroll_tables import extract_table_semantics
+        def visual(value):
+            # Simulated pdfplumber presentation-order Arabic.
+            text=value[::-1]
+            import re
+            return re.sub(r"\d+(?:[.,٫،]\d+)*",lambda m:m.group()[::-1],text)
+        class FakePage:
+            def extract_tables(self):
+                return [
+                    [
+                        [visual("اسم الموظف: موظف تجريبي محمد علي رقم الصرف: 00001-30200105 الرقم القومي: 00000000000001"),None,None,None,None],
+                        [None,visual("الاستحقاقات"),None,None,None],
+                        [None,visual("القيمة"),None,None,None],
+                        [None,"100.00",None,visual("بدل الجامعة"),"21110442"],
+                        [None,"100.00",None,visual("اجمالي الاستحقاقات"),None],
+                        [None,"5.00",None,visual("حكومة 1 إصابة عمل"),"21120202"],
+                    ],
+                    [
+                        [visual("الاستقطاعات"),None,None,None],
+                        [visual("القيمة"),None,None,None],
+                        [None,"40.00",visual("مؤمن 9 شيخوخة"),"41110201"],
+                        ["40.00",None,visual("اجمالي الاستقطاعات"),None],
+                    ]
+                ]
+        text=extract_table_semantics(FakePage())
+        self.assertIsNotNone(text)
+        self.assertIn("الاستحقاقات",text)
+        self.assertIn("الاستقطاعات",text)
+        self.assertEqual(1,text.count("21110442"))
+        self.assertIn("اجمالي الاستحقاقات 100.00",text)
+        self.assertIn("اجمالي الاستقطاعات 40.00",text)
+
+    def test_unclassified_continuation_is_promoted_only_with_official_gross_match(self):
+        first=(header()+"الاستحقاقات\n21110442 بدل الجامعة 100.00\n"
+               "اجمالي الاستحقاقات 115.00\nالاستقطاعات\n"
+               "41110201 مؤمن 9 شيخوخة 40.00\nاجمالي الاستقطاعات 40.00")
+        second="21110443 حافز تكميلي 15.00 [قسم غير مؤكد]\nالصافي: 75.00"
+        report=import_page_texts("supplement.pdf",[first,second])
+        employee=report.employees[0]
+        self.assertEqual(Decimal("115"),sum((e.amount for e in employee.entries
+                          if e.kind=="Earning"),Decimal(0)))
+        self.assertTrue(any("صفحات تكميلية" in w for w in employee.warnings))
+        self.assertFalse(report.verified)
+
 class ExcelTests(unittest.TestCase):
     def test_selective_export_three_sheets_numeric_and_text_codes(self):
         report=valid_report()
