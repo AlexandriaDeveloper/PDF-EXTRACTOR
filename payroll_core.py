@@ -6,6 +6,8 @@ are hard-coded. Actual source-page text is never written to diagnostic logs.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import os
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 import re
@@ -21,6 +23,7 @@ _DECIMAL_NUM = re.compile(r"(?<!\d)[-+]?(?:\d{1,3}(?:,\d{3})+|\d+)\.\d{1,2}(?!\d
 _ACCOUNT = re.compile(r"(?<!\d)\d{8}(?!\d)")
 _NATIONAL_ID = re.compile(r"(?<!\d)\d{14}(?!\d)")
 _DISBURSEMENT = re.compile(r"(?<!\d)\d{7,9}\s*-\s*\d{4,6}(?!\d)")
+_REVERSED_DISBURSEMENT = re.compile(r"(?<!\d)(\d{4,6})\s*-\s*(\d{8})(?!\d)")
 _SECTION_EARNING = ("الاستحقاقات",)
 _SECTION_DEDUCTION = ("الاستقطاعات",)
 _HEADINGS = (
@@ -154,6 +157,7 @@ class PayrollEntry:
     amount: Decimal
     page: int
     raw_text: str
+    source_section: str | None = None
 
     @property
     def choice_key(self) -> str:
@@ -201,7 +205,14 @@ def _employee_header(lines: list[str]) -> dict[str, str | None]:
     labeled_pay = _first_labeled(joined, "رقم الصرف",
         ("الرقم القومي", "الرقم القومى", "نوع الصرف", "البنك", "الفرع"))
     pay_match = _DISBURSEMENT.search(labeled_pay or "")
-    pay = re.sub(r"\s+", "", pay_match.group()) if pay_match else None
+    if pay_match:
+        pay = re.sub(r"\s+", "", pay_match.group())
+    else:
+        # pdfplumber may reverse the *order* of both numeric groups while
+        # keeping each group internally readable. 54865-30200105 must be
+        # canonicalized to 30200105-54865, never guessed from another field.
+        reversed_pay = _REVERSED_DISBURSEMENT.search(labeled_pay or "")
+        pay = (reversed_pay.group(2) + "-" + reversed_pay.group(1)) if reversed_pay else None
     labeled_id = _first_labeled(joined, "الرقم القومي",
         ("نوع الصرف", "البنك", "الفرع", "الرقم التاميني", "الدرجه", "الاداره"))
     nid_match = _NATIONAL_ID.search(labeled_id or "")
@@ -263,7 +274,7 @@ def _entry_from_text(line: str, state: str, page: int) -> PayrollEntry | None:
     # Government contributions are informative even when Oracle prints them
     # near the deduction section: they are not employee cash earnings.
     kind = "Informational" if "حكومه" in key(label) else state
-    return PayrollEntry(kind, code, label, amount, page, line)
+    return PayrollEntry(kind, code, label, amount, page, line, state)
 
 
 def _parse_employee(pages: list[tuple[int, str]]) -> PayrollEmployee:
@@ -402,23 +413,31 @@ def _parse_employee(pages: list[tuple[int, str]]) -> PayrollEmployee:
 
     sums = {kind: sum((e.amount for e in employee.entries if e.kind == kind), Decimal("0"))
             for kind in ("Earning", "Deduction", "Informational")}
-    if employee.gross is not None and sums["Earning"] != employee.gross:
+    informational_deductions = sum(
+        (e.amount for e in employee.entries
+         if e.kind == "Informational" and e.source_section == "Deduction"),
+        Decimal("0"))
+    tolerance = Decimal("0.02")
+    if employee.gross is not None and abs(sums["Earning"] - employee.gross) > tolerance:
         employee.warnings.append("بنود الاستحقاقات لا تساوي إجمالي Oracle الرسمي")
-    if employee.deductions is not None and sums["Deduction"] != employee.deductions:
-        # Employer contribution details may be embedded in printed deductions.
-        if sums["Deduction"] + sums["Informational"] != employee.deductions:
+    if employee.deductions is not None:
+        acceptable = (sums["Deduction"], sums["Deduction"] + informational_deductions,
+                      sums["Deduction"] + sums["Informational"])
+        if min(abs(employee.deductions - value) for value in acceptable) > tolerance:
             employee.warnings.append("بنود الاستقطاعات/حصص الحكومة لا تساوي الإجمالي الرسمي")
     if not any(e.kind == "Earning" for e in employee.entries):
         employee.warnings.append("لا توجد بنود استحقاق مؤكدة")
     if not any(e.kind == "Deduction" for e in employee.entries):
         employee.warnings.append("لا توجد بنود استقطاع مؤكدة")
-    if (employee.gross is not None and employee.deductions is not None
-            and employee.net is not None):
-        # Oracle's employer shares may be included in the printed deductions;
-        # do not assert one algebraic convention without verifying its context.
-        simple = employee.gross - employee.deductions
-        with_employer = employee.gross + sums["Informational"] - employee.deductions
-        if min(abs(employee.net-simple), abs(employee.net-with_employer)) > Decimal("0.02"):
+    if employee.gross is not None and employee.deductions is not None and employee.net is not None:
+        # The real Oracle payslips can print employer contributions inside
+        # official deductions while cash net remains earnings minus employee
+        # cash deductions. Historical layouts may use another convention:
+        # never force a single equation without a matching source control.
+        candidate_cash = employee.gross - sums["Deduction"]
+        candidate_legacy = employee.gross + sums["Informational"] - employee.deductions
+        if min(abs(employee.net - candidate_cash),
+               abs(employee.net - candidate_legacy)) > tolerance:
             employee.warnings.append("الصافي لا يتطابق مع المعادلات المالية المدعومة")
     return employee
 
@@ -506,18 +525,55 @@ def _page_stream(page: object) -> str:
     return table_text if _candidate_quality(table_text) > text_score else text
 
 
-def import_pdf(path: str | Path, progress: Callable[[int, int], None] | None = None) -> ImportReport:
-    pdf_path = Path(path)
-    text_pages: list[str] = []
-    with pdfplumber.open(str(pdf_path)) as pdf:
-        total = len(pdf.pages)
-        for ix, page in enumerate(pdf.pages, start=1):
+def _pdf_chunk(path: str, start: int, end: int) -> list[tuple[int, str]]:
+    """Independent PDF handle per process: never share pdfminer page objects."""
+    from payroll_tables import extract_table_semantics
+
+    pages: list[tuple[int, str]] = []
+    with pdfplumber.open(path) as document:
+        for index in range(start, end):
+            page = document.pages[index]
             try:
-                # Pick one representation of each page to avoid duplicate
-                # financial entries. Never infer Earning/Deduction from columns.
-                text_pages.append(_page_stream(page))
+                semantic = extract_table_semantics(page)
+                pages.append((index, semantic if semantic is not None else _page_stream(page)))
             finally:
                 page.flush_cache()
+    return pages
+
+
+def import_pdf(path: str | Path, progress: Callable[[int, int], None] | None = None) -> ImportReport:
+    pdf_path = Path(path)
+    with pdfplumber.open(str(pdf_path)) as document:
+        total = len(document.pages)
+    if total == 0:
+        return ImportReport(pdf_path.name, [], 0, ["PDF فارغ"])
+
+    chunk_size = 12
+    chunks = [(start, min(total, start + chunk_size))
+              for start in range(0, total, chunk_size)]
+    workers = min(8, max(1, (os.cpu_count() or 2) - 1), len(chunks))
+    results: dict[int, list[tuple[int, str]]] = {}
+    completed = 0
+    # Single-page files incur no process-launch overhead; large private Oracle
+    # reports are parsed in parallel and restored to original page order.
+    if workers == 1:
+        for start, end in chunks:
+            results[start] = _pdf_chunk(str(pdf_path), start, end)
+            completed += end - start
             if progress:
-                progress(ix, total)
-    return import_page_texts(pdf_path.name, text_pages)
+                progress(completed, total)
+    else:
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(_pdf_chunk, str(pdf_path), start, end): start
+                       for start, end in chunks}
+            for future in as_completed(futures):
+                start = futures[future]
+                records = future.result()
+                results[start] = records
+                completed += len(records)
+                if progress:
+                    progress(completed, total)
+    ordered = [text for start in sorted(results) for _, text in results[start]]
+    if len(ordered) != total:
+        raise RuntimeError("PDF extraction returned an incomplete page set")
+    return import_page_texts(pdf_path.name, ordered)
