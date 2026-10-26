@@ -123,7 +123,7 @@ def extract_table_semantics(page: object) -> str | None:
                 lines.append(account + " " + description + " [مبلغ غير مؤكد]")
                 continue
             if not section and "حكوم" not in signature:
-                lines.append(account + " " + description + " [قسم غير مؤكد]")
+                lines.append(account + " " + description + " " + str(amounts[0]) + " [قسم غير مؤكد]")
                 continue
             lines.append(account + " " + description + " " + str(amounts[0]))
             detail_count += 1
