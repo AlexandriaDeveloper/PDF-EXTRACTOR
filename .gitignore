@@ -1,0 +1,17 @@
+build/
+dist/
+*.exe
+*.pyc
+__pycache__/
+.pytest_cache/
+*.pdf
+*.xlsx
+*.xls
+*.csv
+debug_output.txt
+*.db
+.env
+.venv/
+venv/
+.idea/
+.vscode/
