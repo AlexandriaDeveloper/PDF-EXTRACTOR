@@ -201,6 +201,15 @@ class PdfSourceTests(unittest.TestCase):
         self.assertEqual(1,text.count("21110442"))
         self.assertIn("اجمالي الاستحقاقات 100.00",text)
         self.assertIn("اجمالي الاستقطاعات 40.00",text)
+        imported=import_page_texts("semantic-table.pdf",[text+"\nالصافي: 60.00"])
+        employee=imported.employees[0]
+        self.assertEqual(NID_A,employee.national_id)
+        self.assertEqual(PAY_A,employee.disbursement_number)
+        self.assertEqual("30200105",employee.institutional_entity_code)
+        self.assertEqual(Decimal("100.00"),employee.gross)
+        self.assertEqual(Decimal("40.00"),employee.deductions)
+        self.assertEqual(Decimal("60.00"),employee.net)
+        self.assertNotIn("30200105",[e.account_code for e in employee.entries])
 
     def test_unclassified_continuation_is_promoted_only_with_official_gross_match(self):
         first=(header()+"الاستحقاقات\n21110442 بدل الجامعة 100.00\n"
