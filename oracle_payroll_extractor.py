@@ -362,6 +362,8 @@ class SmartPayrollApp:
 
 
 if __name__=="__main__":
+    import multiprocessing
+    multiprocessing.freeze_support()  # Required for Windows PyInstaller worker processes.
     root=tk.Tk()
     SmartPayrollApp(root)
     root.mainloop()
