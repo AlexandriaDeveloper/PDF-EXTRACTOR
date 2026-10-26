@@ -236,7 +236,7 @@ def _header_present(lines: list[str]) -> bool:
 
 
 def _entry_from_text(line: str, state: str, page: int) -> PayrollEntry | None:
-    if _metadata_line(line) or _summary_kind(line):
+    if _metadata_line(line) or _summary_kind(line) or "غير مؤكد" in line:
         return None
     k = key(line)
     if ("اجمالي" in k or "الصافي" in k or k.startswith("x ")
@@ -270,6 +270,8 @@ def _entry_from_text(line: str, state: str, page: int) -> PayrollEntry | None:
     label = (stripped[:chosen.start()] + " " + stripped[chosen.end():]).strip()
     label = re.sub(r"\s+", " ", label)
     if not re.search(r"[\u0621-\u064a]", label) or len(label) < 3:
+        return None
+    if state == "Informational" and "حكومه" not in key(label):
         return None
     # Government contributions are informative even when Oracle prints them
     # near the deduction section: they are not employee cash earnings.
