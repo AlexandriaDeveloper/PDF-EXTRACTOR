@@ -176,7 +176,17 @@ def parse_text_pages(pages: list[str]) -> list[dict]:
                 current["entries"].append({"kind":item[0],"account_code":item[1],
                                            "label":item[2],"amount":value,"page":page_index+1,"raw_text":line})
                 current["items"][item]=current["items"].get(item,Decimal(0))+value
+    identities={}
     for employee in employees:
+        if employee.get("national_id") is None:employee["warnings"].append("الرقم القومي غير مثبت")
+        if employee.get("disbursement_number") is None:employee["warnings"].append("رقم الصرف غير مثبت")
+        if employee.get("name")==UNKNOWN:employee["warnings"].append("اسم الموظف غير مثبت")
+        identity=employee.get("national_id") or employee.get("disbursement_number")
+        if identity:
+            if identity in identities:
+                employee["warnings"].append("تكرار معرف الموظف في السجلات")
+                identities[identity]["warnings"].append("تكرار معرف الموظف في السجلات")
+            identities[identity]=employee
         earning=sum((v for (k,_,_),v in employee["items"].items() if k==EARNING),Decimal(0))
         deduction=sum((v for (k,_,_),v in employee["items"].items() if k==DEDUCTION),Decimal(0))
         if employee["printed_gross"] is None:employee["warnings"].append("إجمالي الاستحقاقات الرسمي غير متاح")
