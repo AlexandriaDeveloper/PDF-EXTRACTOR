@@ -1,3 +1,38 @@
+## Layout-adaptive extraction (not tuned to one PDF)
+
+The original PDF is a **regression fixture**, not the only supported
+report. Payslip content is extracted from labeled fields and neighboring
+account/description/amount cells, rather than fixed physical table indexes,
+hard-coded account lists, a fixed employee count, or two-page grouping.
+
+- Detect right-to-left visual Arabic versus ordinary logical Arabic instead
+  of automatically reversing every source.
+- Infer earnings/deductions from **printed section headings**, including
+  parallel panes sharing one physical table. When headings are absent,
+  use the matching official subtotal to infer the section.
+- Treat an informational government share differently depending on whether
+  the actual section is earnings or deductions.
+- Match account descriptions to their own nearby numeric amount, including
+  reversed and expanded column layouts; do not classify from account-prefix
+  alone (account numbers are identifiers, not a fixed taxonomy).
+- Support identity labels split across multiple header lines and preserve
+  employee boundaries regardless of page count.
+- Refuse automatic verification on missing/contradictory monetary totals,
+  uncertain sections, or unrecognized employee headers. Those records require
+  human review, and unknown layouts retain the legacy conservative fallback.
+
+Automated regression coverage uses fabricated reports with reordered financial
+tables, padded/reversed columns, unfamiliar 8-digit account codes,
+right-to-left and natural Arabic, government-labelled deductions, combined
+earnings and deductions in one table, extra continuation pages, and incomplete
+identity headers.
+
+The previously supplied original 438-page Oracle report still reconciles
+completely in the private local end-to-end test, but this **does not prove**
+that a different 386-page file or every Oracle layout is supported. Every
+new report variant must pass independent identity, row-level and official
+financial reconciliations. No raw salary PDFs are committed.
+
 ## Financially verified original Oracle PDF layout
 
 The production payslip layout is **not** one ledger item per extracted
