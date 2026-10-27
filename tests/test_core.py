@@ -45,6 +45,16 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(len([k for k in first["items"] if k[0]==INFORMATIONAL]),1)
         self.assertTrue(all(k[1]!="30200105" for k in first["items"]))
 
+    def test_two_accounts_in_one_visual_row_do_not_lose_second_entry(self):
+        doc=SYNTHETIC.replace("21110442 بدل الجامعة 100.00\n21110443 مكافأة 50.00",
+            "21110442 بدل الجامعة 100.00 21110443 مكافأة 50.00")
+        records=parse_text_pages([doc])
+        self.assertEqual(len(records),1)
+        self.assertEqual(records[0]["status"],"Verified")
+        self.assertIn((EARNING,"21110442","بدل الجامعة"),records[0]["items"])
+        self.assertIn((EARNING,"21110443","مكافأة"),records[0]["items"])
+        self.assertEqual(records[0]["printed_gross"],Decimal("150.00"))
+
     def test_continuation_and_repeated_items_need_review(self):
         pages=[SYNTHETIC.replace("الصافي: 110.00",""),
                "رقم الصرف: 30200105-00001 الرقم القومى: 00000000000001\n21120202 حكومة إصابة عمل 5.00\nالصافي: 110.00"]
