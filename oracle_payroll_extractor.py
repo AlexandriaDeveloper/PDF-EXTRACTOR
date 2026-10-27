@@ -160,8 +160,18 @@ def extract_emp_info(text):
 def parse_page(page):
     """Read page text only; grouping and item identification require document context."""
     text = page.extract_text() or ""
-    # Table extraction is a fallback for sources without a usable Unicode text stream.
-    # The fallback remains untrusted until context and financial checks succeed.
+    # PDFium / pdfplumber may expose presentation-order Arabic lines reversed.
+    # Only decode when explicit Oracle labels/sections become more recognizable.
+    def semantic_score(value):
+        normalized = standard(value)
+        return sum(normalized.count(token) for token in (
+            "اسم الموظف", "رقم الصرف", "الاستحقاقات", "الاستقطاعات",
+            "الصافي", "الصافى", "حكومة", "اجمالي"))
+    visual="\n".join(decode_oracle_text(line) for line in text.splitlines())
+    if semantic_score(visual)>semantic_score(text):
+        text=visual
+    # Table extraction is a fallback when the page has no readable Unicode text.
+    # We do not infer financial values from numeric cells purely by their position.
     if not text.strip():
         rows = page.extract_tables() or []
         text = "\n".join(" ".join(str(c or "") for c in row) for table in rows for row in table)
