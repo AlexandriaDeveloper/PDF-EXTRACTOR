@@ -182,9 +182,12 @@ def parse_row(row: list, table_index: int, page_number: int,
         amounts=[(abs(j-di),j,parse_money(cell))
                  for j,cell in enumerate(cells) if parse_money(cell) is not None]
         # Exclude values belonging to a different code in the same physical row.
+        competing_labels=[neighbor for other_index,_ in positions if other_index!=ci
+                          for neighbor in (other_index-1,other_index+1)
+                          if 0<=neighbor<len(cells) and re.search("[ء-ي]",labels[neighbor])]
         amounts=[x for x in amounts if x[0]<=2
-                 and all(abs(x[1]-other_index)>abs(di-other_index)
-                         for other_index,_ in positions if other_index!=ci)]
+                 and all(abs(x[1]-di)<abs(x[1]-neighbor)
+                         for neighbor in competing_labels)]
         if not amounts:continue
         amounts.sort(key=lambda x:(x[0],x[1]))
         if len(amounts)>1 and amounts[0][0]==amounts[1][0]:
