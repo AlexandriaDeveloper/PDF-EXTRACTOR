@@ -116,6 +116,19 @@ class LayoutMatrixTests(unittest.TestCase):
         items={(x["account_code"],x["kind"],x["amount"]) for x in page["entries"]}
         self.assertIn(("76543210","الاستقطاعات",Decimal('20')),items)
         self.assertIn(("98765432","الاستحقاقات",Decimal('100')),items)
+    def test_incomplete_second_employee_header_blocks_cross_employee_merging(self):
+        first,continuation=reformat()
+        broken=copy.deepcopy(first)
+        broken["oracle_original_text"]=(
+            mirror("اسم الموظف: موظف ثاني رقم الصرف: 30200105-00002")
+            +"\n"+mirror("الرقم القومي: غير متاح")
+        )
+        result,diagnostics=parse_document([first,continuation,broken])
+        self.assertEqual(len(result),1)
+        self.assertEqual(result[0]["pages"],[1,2])
+        self.assertEqual(result[0]["status"],"ReviewRequired")
+        self.assertEqual(diagnostics["unrecognized_employee_headers"],1)
+
     def test_bad_total_remains_review(self):
         pages=reformat(codes=True,swapped=True)
         pages[1]['oracle_tables'][0][1][1]="119.00"
