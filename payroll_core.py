@@ -183,7 +183,18 @@ def parse_text_pages(pages: list[str]) -> list[dict]:
         elif earning != employee["printed_gross"]:employee["warnings"].append("اختلاف إجمالي الاستحقاقات عن البنود")
         if employee["printed_deductions"] is None:employee["warnings"].append("إجمالي الاستقطاعات الرسمي غير متاح")
         elif deduction != employee["printed_deductions"]:employee["warnings"].append("اختلاف إجمالي الاستقطاعات عن البنود")
-        if employee["printed_net"] is None:employee["warnings"].append("صافي Oracle الرسمي غير متاح")
+        if employee["printed_net"] is None:
+            employee["warnings"].append("صافي Oracle الرسمي غير متاح")
+        elif employee["printed_gross"] is not None and employee["printed_deductions"] is not None:
+            gross=employee["printed_gross"];ded=employee["printed_deductions"]
+            net=employee["printed_net"]
+            employer=sum((v for (k,_,_),v in employee["items"].items()
+                          if k==INFORMATIONAL),Decimal(0))
+            # Oracle layouts differ in whether employer shares enter printed
+            # deduction totals. Both known equations are explicit checks;
+            # unexplained differences must remain reviewable.
+            if abs(gross-ded-net)>Decimal("0.02") and abs(gross+employer-ded-net)>Decimal("0.02"):
+                employee["warnings"].append("الصافي الرسمي لا يتطابق مع الإجماليات وحصص جهة العمل")
         employee["status"]="ReviewRequired" if employee["warnings"] else "Verified"
     return employees
 
