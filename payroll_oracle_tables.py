@@ -80,27 +80,39 @@ def account_code(value: object) -> str | None:
     return s if CODE.fullmatch(s) else None
 
 def parse_header(raw_text: str) -> dict | None:
-    for line in (raw_text or "").splitlines()[:12]:
-        restored = logical(line)
-        if "اسم الموظف" not in key(restored) or "رقم الصرف" not in key(restored):
-            continue
-        name = re.search(
-            r"اسم\s+الموظف\s*:\s*(.*?)\s+رقم\s+الصرف\s*:",
-            restored
-        )
-        pay = re.search(r"(?<!\d)(\d{8})\s*-\s*(\d{4,6})(?!\d)", restored)
-        national = re.search(r"(?<!\d)(\d{14})(?!\d)", restored)
-        if not (name and pay and national):
-            # A partial header must not silently open an unidentifiable employee.
-            return None
-        return {
-            "name":name.group(1).strip(),
-            "code":pay.group(2),
-            "disbursement_number":pay.group(1)+"-"+pay.group(2),
-            "institutional_code":pay.group(1),
-            "national_id":national.group(1),
-        }
-    return None
+    """Read labeled identity values across logical *or* visual Arabic lines.
+
+    Labels can be on separate lines; bare 8-digit institutional codes are never
+    treated as ledger accounts or a complete employee identity.
+    """
+    lines=[logical(line) for line in (raw_text or "").splitlines()[:18]]
+    text="\n".join(lines)
+    if "اسم الموظف" not in key(text) or "رقم الصرف" not in key(text):
+        return None
+    name=re.search(
+        r"اسم\s*الموظف\s*:\s*(.*?)\s*(?=رقم\s*الصرف\s*:|الرقم\s*القوم[يى]\s*:|نوع\s*الصرف\s*:|$)",
+        text,re.S
+    )
+    pay=re.search(
+        r"رقم\s*الصرف\s*:\s*(\d{7,9})\s*-\s*(\d{4,6})(?!\d)",
+        text
+    )
+    national=re.search(
+        r"الرقم\s*القوم[يى]\s*:\s*(\d{14})(?!\d)",
+        text
+    )
+    if not (name and pay and national):
+        return None
+    clean_name=re.sub(r"\s+"," ",name.group(1)).strip()
+    if not clean_name or any(c.isdigit() for c in clean_name):
+        return None
+    return {
+        "name":clean_name,
+        "code":pay.group(2),
+        "disbursement_number":pay.group(1)+"-"+pay.group(2),
+        "institutional_code":pay.group(1),
+        "national_id":national.group(1),
+    }
 
 def section_label(text: object) -> str | None:
     normalized=key(logical(text))
