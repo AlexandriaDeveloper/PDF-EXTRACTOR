@@ -12,6 +12,8 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import openpyxl
+from decimal import Decimal
+from payroll_core import parse_text_pages, standard, export_amount, EARNING, DEDUCTION, INFORMATIONAL
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
@@ -155,50 +157,15 @@ def extract_emp_info(text):
     return emp_name, emp_code
 
 def parse_page(page):
-    """تحليل صفحة واحدة: الاسم، الكود، وكل البنود {(القسم, البند): المبلغ}"""
-    tables = page.extract_tables()
+    """Read page text only; grouping and item identification require document context."""
+    text = page.extract_text() or ""
+    # Table extraction is a fallback for sources without a usable Unicode text stream.
+    # The fallback remains untrusted until context and financial checks succeed.
+    if not text.strip():
+        rows = page.extract_tables() or []
+        text = "\n".join(" ".join(str(c or "") for c in row) for table in rows for row in table)
+    return {"raw_text": text, "page": page.page_number}
 
-    # الترويسة (الاسم والكود) موجودة غالباً في أول خلية بالجدول - تغنينا عن extract_text المكلفة
-    header = ""
-    if tables and tables[0] and tables[0][0]:
-        header = "\n".join(str(c) for c in tables[0][0] if c)
-    emp_name, emp_code = extract_emp_info(header)
-    if emp_name == UNKNOWN or emp_code == UNKNOWN:
-        n2, c2 = extract_emp_info(page.extract_text() or "")
-        if emp_name == UNKNOWN: emp_name = n2
-        if emp_code == UNKNOWN: emp_code = c2
-
-    items = {}
-    for t in tables:
-        t_dec = decode_oracle_text(" ".join(str(c) for r in t for c in r if c))
-        is_deduc_table = ("الاستقطاعات" in t_dec) and ("الاستحقاقات" not in t_dec)
-        is_entit_table = ("الاستحقاقات" in t_dec)
-        for row in t:
-            if any(c and str(c).count("\n") > 3 for c in row):
-                continue
-            val_flags = [is_val(c) for c in row]
-            if not any(val_flags):
-                continue
-            for i, cell in enumerate(row):
-                if not cell or val_flags[i]:
-                    continue
-                raw_s = str(cell).strip()
-                if len(raw_s) < 3:
-                    continue
-                clean_s = decode_oracle_text(raw_s)
-                if not re.search(r'[\u0621-\u064A]', clean_s) or len(clean_s) < 3 or is_ignored_item(clean_s):
-                    continue
-                if is_deduc_table:
-                    cat = "الاستقطاعات"
-                elif is_entit_table:
-                    cat = "الاستقطاعات" if (len(row) > 6 and i < len(row) // 2) else "الاستحقاقات"
-                else:
-                    cat = "الاستقطاعات" if (len(row) <= 4 or i < len(row) // 2) else "الاستحقاقات"
-                amount = next((str(c).strip() for j, c in enumerate(row) if j != i and val_flags[j]), "")
-                if amount and (cat, clean_s) not in items:
-                    items[(cat, clean_s)] = parse_amount_to_float(amount)
-                break  # بند واحد لكل صف
-    return {"name": emp_name, "code": emp_code, "items": items}
 
 def parse_page_range(path, start, end):
     """تُنفذ داخل عملية منفصلة: تحليل مجموعة صفحات"""
@@ -220,6 +187,7 @@ class SmartPayrollApp:
         self.items_db = {"الاستقطاعات": [], "الاستحقاقات": []}
         self.pages_data = []
         self.current_export_info = None
+        self.parsed_employees = []
         self.msg_queue = queue.Queue()
         
         self.setup_ui()
@@ -419,10 +387,11 @@ class SmartPayrollApp:
     def _on_parse_done(self):
         """بناء قوائم البنود من البيانات المخزنة في الذاكرة"""
         items_set = {"الاستقطاعات": set(), "الاستحقاقات": set()}
-        for pg in self.pages_data:
-            for (cat, item) in pg["items"]:
+        self.parsed_employees = self.get_unified_employees(self.pages_data)
+        for emp in self.parsed_employees:
+            for (cat, account, label) in emp["items"]:
                 if cat in items_set:
-                    items_set[cat].add(item)
+                    items_set[cat].add(f"{account} | {label}")
         for cat in items_set:
             self.items_db[cat] = sorted(items_set[cat])
 
@@ -449,33 +418,12 @@ class SmartPayrollApp:
             self.combo_item.config(state="disabled")
 
     def get_unified_employees(self, pages_data):
-        """
-        توحيد بيانات الموظف:
-        1. دمج الصفحات الممتدة (Continuation Pages) التي لا تحتوي على ترويسة إلى الموظف السابق لها مباشرة.
-        2. دمج أي تكرار لنفس كود الموظف.
-        """
-        emps = []
-        curr_emp = None
-        for pg in pages_data:
-            is_cont = (pg.get("name") == UNKNOWN and pg.get("code") == UNKNOWN)
-            if not is_cont:
-                curr_emp = {
-                    "code": str(pg.get("code", "")).strip(),
-                    "name": str(pg.get("name", "")).strip(),
-                    "items": dict(pg.get("items", {}))
-                }
-                emps.append(curr_emp)
-            else:
-                if curr_emp is not None:
-                    curr_emp["items"].update(pg.get("items", {}))
-                else:
-                    curr_emp = {
-                        "code": UNKNOWN,
-                        "name": UNKNOWN,
-                        "items": dict(pg.get("items", {}))
-                    }
-                    emps.append(curr_emp)
-        return emps
+        """Build employees from the complete ordered text stream, not page-local guesses."""
+        records = parse_text_pages([p.get("raw_text", "") for p in pages_data])
+        for emp in records:
+            # Preserve the legacy display shape while retaining structured identity.
+            emp["display_items"] = {(kind, label): value for (kind, code, label), value in emp["items"].items()}
+        return records
 
     def fix_ar(self, t):
         if not t: return ""
@@ -493,7 +441,13 @@ class SmartPayrollApp:
         for i in self.tree.get_children():
             self.tree.delete(i)
 
-        unified_pages = self.get_unified_employees(self.pages_data)
+        unified_pages = getattr(self, "parsed_employees", None) or self.get_unified_employees(self.pages_data)
+        self.current_employees = unified_pages
+        def lookup(pg, cat, item):
+            matches = [(k, v) for k, v in pg["items"].items()
+                       if k[0] == cat and f"{k[1]} | {k[2]}" == item]
+            if not matches: return None if pg["status"] != "Verified" else Decimal(0)
+            return sum((v for _, v in matches), Decimal(0))
 
         if mode == "بند مالي واحد محدد":
             target_item = self.combo_item.get()
@@ -516,9 +470,9 @@ class SmartPayrollApp:
 
             results = []
             for pg in unified_pages:
-                amount_val = pg["items"].get(key)
+                amount_val = lookup(pg, category, target_item)
                 if amount_val is not None:
-                    amount_num = parse_amount_to_float(amount_val)
+                    amount_num = float(amount_val)
                     idx = len(results) + 1
                     self.tree.insert("", tk.END, values=(
                         idx,
@@ -577,9 +531,9 @@ class SmartPayrollApp:
                 row_vals = [idx, to_hindi_nums(pg["code"]), self.fix_ar(pg["name"])]
                 row_sum = 0.0
                 for itm in items_list:
-                    amt = pg["items"].get((cat_name, itm), 0.0)
-                    row_sum += amt
-                    row_vals.append(to_hindi_nums(f"{amt:,.2f}") if amt > 0 else "-")
+                    amt = lookup(pg, cat_name, itm)
+                    if amt is not None: row_sum += float(amt)
+                    row_vals.append(to_hindi_nums(f"{amt:,.2f}") if amt is not None else "غير متاح")
                 row_vals.append(to_hindi_nums(f"{row_sum:,.2f}"))
                 self.tree.insert("", tk.END, values=row_vals)
 
@@ -624,22 +578,23 @@ class SmartPayrollApp:
             self.tree.column("صافي الراتب", anchor=tk.E, width=140)
 
             for idx, pg in enumerate(unified_pages, start=1):
-                tot_ent = sum(pg["items"].get(("الاستحقاقات", itm), 0.0) for itm in ent_items)
-                tot_ded = sum(pg["items"].get(("الاستقطاعات", itm), 0.0) for itm in ded_items)
-                net = tot_ent - tot_ded
+                tot_ent = pg.get("printed_gross")
+                tot_ded = pg.get("printed_deductions")
+                net = pg.get("printed_net")
+                # Official Oracle totals are authoritative. Never fabricate a net amount.
 
                 row_vals = [idx, to_hindi_nums(pg["code"]), self.fix_ar(pg["name"])]
                 for itm in ent_items:
-                    amt = pg["items"].get(("الاستحقاقات", itm), 0.0)
-                    row_vals.append(to_hindi_nums(f"{amt:,.2f}") if amt > 0 else "-")
-                row_vals.append(to_hindi_nums(f"{tot_ent:,.2f}"))
+                    amt = lookup(pg, "الاستحقاقات", itm)
+                    row_vals.append(to_hindi_nums(f"{amt:,.2f}") if amt is not None else "غير متاح")
+                row_vals.append(to_hindi_nums(f"{tot_ent:,.2f}") if tot_ent is not None else "غير متاح")
 
                 for itm in ded_items:
-                    amt = pg["items"].get(("الاستقطاعات", itm), 0.0)
-                    row_vals.append(to_hindi_nums(f"{amt:,.2f}") if amt > 0 else "-")
-                row_vals.append(to_hindi_nums(f"{tot_ded:,.2f}"))
+                    amt = lookup(pg, "الاستقطاعات", itm)
+                    row_vals.append(to_hindi_nums(f"{amt:,.2f}") if amt is not None else "غير متاح")
+                row_vals.append(to_hindi_nums(f"{tot_ded:,.2f}") if tot_ded is not None else "غير متاح")
 
-                row_vals.append(to_hindi_nums(f"{net:,.2f}"))
+                row_vals.append(to_hindi_nums(f"{net:,.2f}") if net is not None else "غير متاح")
                 self.tree.insert("", tk.END, values=row_vals)
 
             self.current_export_info = {
