@@ -135,8 +135,27 @@ def infer_table_section(table: list, inherited: str | None = None) -> str | None
     if len(summaries)==1:return next(iter(summaries))
     return inherited
 
+def locate_section_columns(table: list) -> list[tuple[int,str]]:
+    """Determine pane regions from printed financial headings, not table order."""
+    anchors={}
+    for row in table[:min(12,len(table))]:
+        for index,cell in enumerate(row):
+            label=section_label(cell)
+            if label:anchors[index]=label
+    return sorted(anchors.items())
+
+def section_for_code(column: int, anchors: list[tuple[int,str]],
+                     default: str | None) -> str | None:
+    kinds={kind for _,kind in anchors}
+    if len(kinds)<=1:return next(iter(kinds)) if kinds else default
+    distances=sorted((abs(column-col),col,kind) for col,kind in anchors)
+    if len(distances)>1 and distances[0][0]==distances[1][0] and distances[0][2]!=distances[1][2]:
+        return None
+    return distances[0][2]
+
 def parse_row(row: list, table_index: int, page_number: int,
-              section: str | None = None) -> list[dict]:
+              section: str | None = None,
+              anchors: list[tuple[int,str]] | None = None) -> list[dict]:
     """Associate nearby financial cells with a code, not fixed coordinates.
 
     Parameter table_index exists for legacy callers, but deliberately has
@@ -170,8 +189,9 @@ def parse_row(row: list, table_index: int, page_number: int,
         amounts.sort(key=lambda x:(x[0],x[1]))
         if len(amounts)>1 and amounts[0][0]==amounts[1][0]:
             continue
-        kind=(INFORMATIONAL if "حكوم" in normalized and section!=DEDUCTION
-              else section)
+        row_section=section_for_code(ci,anchors or [],section)
+        kind=(INFORMATIONAL if "حكوم" in normalized and row_section!=DEDUCTION
+              else row_section)
         if kind not in (EARNING,DEDUCTION,INFORMATIONAL):continue
         entries.append({
             "kind":kind,"account_code":account,"label":label,
@@ -200,12 +220,13 @@ def extract_page(raw_text: str, tables: list, page_number: int) -> dict:
     entries=[];totals={}
     for index,table in enumerate(tables or []):
         section=infer_table_section(table)
+        anchors=locate_section_columns(table)
         for row in table or []:
             if not row:continue
             headings={section_label(cell) for cell in row if cell}
             headings.discard(None)
             if len(headings)==1:section=next(iter(headings))
-            entries.extend(parse_row(row,index,page_number,section))
+            entries.extend(parse_row(row,index,page_number,section,anchors))
             totals.update(parse_totals(row))
     return {"header":parse_header(raw_text),
             "entries":entries,"totals":totals,"page":page_number}
