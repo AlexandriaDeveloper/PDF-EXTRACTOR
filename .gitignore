@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+build/
+dist/
+*.exe
+*.pdf
+*.xlsx
+*.xls
+*.csv
+debug_output.txt
+.env
+.venv/
+.pytest_cache/
