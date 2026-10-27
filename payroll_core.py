@@ -166,16 +166,32 @@ def parse_text_pages(pages: list[str]) -> list[dict]:
                     section=heading
                     continue
                 if not section and "حكوم" not in k:continue
-                parsed=normalize_line_item(line,section)
-                if parsed is None:continue
-                item,value=parsed
-                if item in current["items"]:
-                    # Repeated lines may denote either legitimate repeated payments
-                    # or duplicated PDF text. Flag instead of overwrite/double count.
-                    current["warnings"].append("بند مكرر يحتاج مراجعة: "+item[1]+" "+item[2])
-                current["entries"].append({"kind":item[0],"account_code":item[1],
-                                           "label":item[2],"amount":value,"page":page_index+1,"raw_text":line})
-                current["items"][item]=current["items"].get(item,Decimal(0))+value
+                codes=list(ACCOUNT.finditer(line))
+                if not codes:continue
+                # A physical PDF text line can contain two side-by-side accounts.
+                # Parse each independently; never silently stop after the first.
+                pieces=([line] if len(codes)==1 else
+                    [line[codes[i].start(): codes[i+1].start() if i+1<len(codes) else len(line)]
+                     for i in range(len(codes))])
+                parsed_items=[]
+                for piece in pieces:
+                    account=ACCOUNT.search(piece)
+                    kind=section
+                    if account and section in (EARNING,DEDUCTION):
+                        if account.group(1).startswith("4"):kind=DEDUCTION
+                        elif account.group(1).startswith("2"):kind=EARNING
+                    parsed=normalize_line_item(piece,kind)
+                    if parsed is None:
+                        current["warnings"].append("سطر مالي غير مكتمل يحتاج مراجعة في صفحة "+str(page_index+1))
+                    else:parsed_items.append((parsed,piece))
+                for (item,value),raw_item in parsed_items:
+                    if item in current["items"]:
+                        # Repeated lines may denote either legitimate repeated payments
+                        # or duplicated PDF text. Flag instead of overwrite/double count.
+                        current["warnings"].append("بند مكرر يحتاج مراجعة: "+item[1]+" "+item[2])
+                    current["entries"].append({"kind":item[0],"account_code":item[1],
+                                               "label":item[2],"amount":value,"page":page_index+1,"raw_text":raw_item})
+                    current["items"][item]=current["items"].get(item,Decimal(0))+value
     identities={}
     for employee in employees:
         if employee.get("national_id") is None:employee["warnings"].append("الرقم القومي غير مثبت")
