@@ -121,6 +121,32 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(info["code"],"00001")
         self.assertEqual(info["national_id"],"00000000000001")
 
+    def test_partial_recovery_preserves_semantically_verified_employee(self):
+        strict_text=(
+            "اسم الموظف: موظف مختبر أول رقم الصرف: 30200105-00003 "
+            "الرقم القومي: 00000000000003\n"
+            "الاستحقاقات\n21110442 بدل الجامعة 100.00\n"
+            "اجمالي الاستحقاقات 100.00\n"
+            "الاستقطاعات\n41110201 خصم تجريبي 40.00\n"
+            "اجمالي الاستقطاعات 40.00\nالصافي: 60.00"
+        )
+        page=FakeOraclePage()
+        second_text="\n".join(page.lines).replace(
+            "30200105-00001","30200105-00004").replace(
+            "00000000000001","00000000000004")
+        data=[
+            {"raw_text":strict_text,"table_items":[],"text_chars":len(strict_text)},
+            {"raw_text":second_text,"table_items":extract_table_candidates(page),
+             "text_chars":len(second_text)}
+        ]
+        recovered,stats=recover_records(data)
+        self.assertEqual(len(recovered),2)
+        self.assertEqual(recovered[0]["status"],"Verified")
+        self.assertEqual(recovered[0]["printed_net"],Decimal("60.00"))
+        self.assertEqual(recovered[1]["status"],"ReviewRequired")
+        self.assertEqual(len(recovered[1]["entries"]),2)
+        self.assertTrue(stats["recovery_used"])
+
     def test_empty_pdf_keeps_zero_and_never_claims_success(self):
         result,diagnostics=recover_records([
             {"raw_text":"Document without payslip data","table_items":[],
