@@ -15,6 +15,8 @@ import openpyxl
 from decimal import Decimal
 from payroll_core import parse_text_pages, standard, export_amount, EARNING, DEDUCTION, INFORMATIONAL
 from payroll_excel import create_excel
+from payroll_table_adapter import extract_table_candidates
+from payroll_recovery import recover_records
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
@@ -158,25 +160,32 @@ def extract_emp_info(text):
     return emp_name, emp_code
 
 def parse_page(page):
-    """Read page text only; grouping and item identification require document context."""
-    text = page.extract_text() or ""
-    # PDFium / pdfplumber may expose presentation-order Arabic lines reversed.
-    # Only decode when explicit Oracle labels/sections become more recognizable.
+    """Read both Arabic text and Oracle's physical table cells in one pass."""
+    original=page.extract_text() or ""
+    try:
+        tables=page.extract_tables() or []
+    except Exception:
+        tables=[]
     def semantic_score(value):
-        normalized = standard(value)
+        normalized=standard(value)
         return sum(normalized.count(token) for token in (
-            "اسم الموظف", "رقم الصرف", "الاستحقاقات", "الاستقطاعات",
-            "الصافي", "الصافى", "حكومة", "اجمالي"))
-    visual="\n".join(decode_oracle_text(line) for line in text.splitlines())
-    if semantic_score(visual)>semantic_score(text):
-        text=visual
-    # Table extraction is a fallback when the page has no readable Unicode text.
-    # We do not infer financial values from numeric cells purely by their position.
+            "اسم الموظف","رقم الصرف","الاستحقاقات","الاستقطاعات",
+            "الصافي","الصافى","حكومة","اجمالي"))
+    visual="\n".join(decode_oracle_text(line) for line in original.splitlines())
+    text=visual if semantic_score(visual)>semantic_score(original) else original
     if not text.strip():
-        rows = page.extract_tables() or []
-        text = "\n".join(" ".join(str(c or "") for c in row) for table in rows for row in table)
-    return {"raw_text": text, "page": page.page_number}
-
+        text="\n".join(" ".join(str(c or "") for c in row)
+                       for table in tables for row in table)
+    table_items=extract_table_candidates(page,tables)
+    header=""
+    if tables and tables[0] and tables[0][0]:
+        header="\n".join(str(c) for c in tables[0][0] if c)
+    old_name,old_code=extract_emp_info(header or original)
+    return {
+        "raw_text":text,"page":page.page_number,"table_items":table_items,
+        "legacy_name":old_name,"legacy_code":old_code,
+        "text_chars":len(text),"table_count":len(tables)
+    }
 
 def parse_page_range(path, start, end):
     """تُنفذ داخل عملية منفصلة: تحليل مجموعة صفحات"""
@@ -401,7 +410,9 @@ class SmartPayrollApp:
         self.parsed_employees = self.get_unified_employees(self.pages_data)
         # Export is available immediately after document analysis; preview modes
         # are optional and must never determine which employees are exported.
-        self.btn_xlsx.config(state=tk.NORMAL if self.parsed_employees else tk.DISABLED)
+        meaningful=any(e.get("entries") or e.get("printed_net") is not None
+                       for e in self.parsed_employees)
+        self.btn_xlsx.config(state=tk.NORMAL if meaningful else tk.DISABLED)
         for emp in self.parsed_employees:
             for (cat, account, label) in emp["items"]:
                 if cat in items_set:
@@ -411,14 +422,47 @@ class SmartPayrollApp:
 
         total_pages = len(self.pages_data)
         total_items = len(self.items_db["الاستقطاعات"]) + len(self.items_db["الاستحقاقات"])
-        self.lbl_file.config(text=f"تم المسح: {os.path.basename(self.pdf_path)} ({total_pages} صفحة - {total_items} بند)", fg="green")
+        diagnostics=getattr(self,"last_parse_diagnostics",{})
+        candidates=diagnostics.get("table_candidates",0)
         self.combo_cat.set("الاستقطاعات")
         self.update_item_list()
         self.on_mode_change()
         if total_items == 0:
-            messagebox.showwarning("تنبيه", "لم يتم العثور على أي بنود. تأكد أن الملف يحتوي على جداول نصوص وليس صورا.")
+            self.lbl_file.config(
+                text=f"اكتمل فحص {total_pages} صفحة، ولكن لم يتعرف البرنامج على بنود قابلة للاستخراج",
+                fg="red"
+            )
+            messagebox.showwarning(
+                "لم ينجح استخراج البنود",
+                f"تمت قراءة {total_pages} صفحة؛ بنود النص: {diagnostics.get('semantic_items',0)}، "
+                f"صفوف الجداول المرشحة: {candidates}.\n"
+                "الملف ليس بالضرورة صورة. قد يكون تنسيق Oracle متعدد الأعمدة "
+                "أو نصًا عربيًا معكوس الترتيب. لم يتم إنشاء مبالغ افتراضية.\n"
+                "راجع إصدار التطبيق أو استخدم نسخة PDF النصية الأصلية.",
+            )
+        elif diagnostics.get("recovery_used"):
+            self.lbl_file.config(
+                text=f"قراءة جدولية احتياطية: {total_pages} صفحة، {total_items} بند — تحتاج مراجعة",
+                fg="darkorange"
+            )
+            messagebox.showwarning(
+                "استخراج أولي يحتاج مراجعة",
+                f"عُثر على {total_items} بند بالاستعانة بقراءة جداول Oracle.\n"
+                "هذه البيانات غير معتمدة بعد: راجع الموظفين وأكواد الحساب "
+                "وقيم الاستحقاقات والاستقطاعات والصافي مع أصل PDF قبل استخدامها.",
+            )
         else:
-            messagebox.showinfo("تم المسح بنجاح", f"تم العثور على {total_items} بند مالي مختلف ({len(self.items_db['الاستحقاقات'])} استحقاق و {len(self.items_db['الاستقطاعات'])} استقطاع).\nيمكنك الآن اختيار نمط الاستخراج المطلوب وعرضه أو تصديره فوراً.")
+            self.lbl_file.config(
+                text=f"تم المسح: {os.path.basename(self.pdf_path)} ({total_pages} صفحة - {total_items} بند)",
+                fg="green"
+            )
+            messagebox.showinfo(
+                "انتهى تحليل الملف",
+                f"تم العثور على {total_items} بند مختلف: "
+                f"{len(self.items_db['الاستحقاقات'])} استحقاق و"
+                f" {len(self.items_db['الاستقطاعات'])} استقطاع.\n"
+                "يُرجى مراجعة تحذيرات المطابقة داخل ملف Excel.",
+            )
 
     def update_item_list(self, event=None):
         cat = self.combo_cat.get()
@@ -432,11 +476,14 @@ class SmartPayrollApp:
             self.combo_item.config(state="disabled")
 
     def get_unified_employees(self, pages_data):
-        """Build employees from the complete ordered text stream, not page-local guesses."""
-        records = parse_text_pages([p.get("raw_text", "") for p in pages_data])
-        for emp in records:
-            # Preserve the legacy display shape while retaining structured identity.
-            emp["display_items"] = {(kind, label): value for (kind, code, label), value in emp["items"].items()}
+        """Review-safe Oracle extraction, with the previous table format restored."""
+        records,diagnostics=recover_records(pages_data)
+        self.last_parse_diagnostics=diagnostics
+        for employee in records:
+            employee["display_items"]={
+                (kind, label): amount
+                for (kind,account,label),amount in employee["items"].items()
+            }
         return records
 
     def fix_ar(self, t):

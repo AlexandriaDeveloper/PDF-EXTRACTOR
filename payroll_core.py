@@ -21,6 +21,7 @@ SECTION = {
 ACCOUNT = re.compile(r"(?<!\d)(\d{8})(?!\d)")
 NATIONAL_ID = re.compile(r"(?<!\d)(\d{14})(?!\d)")
 PAYMENT = re.compile(r"(?<!\d)(\d{8})\s*-\s*(\d{4,6})(?!\d)")
+PAYMENT_VISUAL = re.compile(r"(?<!\d)(\d{4,6})\s*-\s*(\d{8})(?!\d)")
 MONEY = re.compile(r"(?<![\d-])-?\d{1,3}(?:,\d{3})+(?:\.\d{1,2})?(?!\d)|(?<![\d-])-?\d+(?:\.\d{1,2})?(?!\d)")
 DECIMAL_AMOUNT = re.compile(r"^-?\d+(?:\.\d{1,2})?$")
 LABEL = re.compile(r"^(?:اسم\s*الموظف|رقم\s*الصرف|الرقم\s*القومي|الرقم\s*القومى|البنك|الفرع|نوع\s*الصرف|الرقم\s*التاميني|الرقم\s*التأميني|الدرجه|الدرجة|الاداره|الإدارة)\s*:")
@@ -68,6 +69,7 @@ def is_metadata(line: str) -> bool:
 def identifier(text: str) -> dict:
     s=standard(text)
     pay=PAYMENT.search(s)
+    visual_pay=PAYMENT_VISUAL.search(s) if pay is None else None
     national=NATIONAL_ID.search(s)
     name=None
     m=re.search(r"اسم\s*الموظف\s*:\s*(.*?)(?=رقم\s*الصرف\s*:|الرقم\s*القوم[يى]\s*:|$)",s,re.S)
@@ -77,9 +79,10 @@ def identifier(text: str) -> dict:
             name=value
     return {
         "name":name or UNKNOWN,
-        "code":pay.group(2) if pay else UNKNOWN,  # legacy display only
-        "disbursement_number": (pay.group(1)+"-"+pay.group(2)) if pay else None,
-        "institutional_code":pay.group(1) if pay else None,
+        "code":(pay.group(2) if pay else visual_pay.group(1) if visual_pay else UNKNOWN),
+        "disbursement_number": ((pay.group(1)+"-"+pay.group(2)) if pay else
+                                (visual_pay.group(2)+"-"+visual_pay.group(1)) if visual_pay else None),
+        "institutional_code":(pay.group(1) if pay else visual_pay.group(2) if visual_pay else None),
         "national_id":national.group() if national else None,
     }
 

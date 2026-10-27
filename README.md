@@ -25,6 +25,27 @@ python oracle_payroll_extractor.py
 
 The CI suite runs tests on Windows and Linux and builds a Windows PyInstaller executable. The current EXE is downloaded from the latest passing GitHub Actions `OraclePayrollExtractor-Windows` artifact. Build files and executables are **not tracked in Git**.
 
+## Oracle visual-order table recovery (October 2026 hotfix)
+
+Some Oracle payslip PDFs store Arabic as visually reversed presentation forms
+and place the code, description and amount in separate text lines across two
+side-by-side tables. The strict line-based parser introduced in the preceding
+version consequently scanned every page yet produced zero items. The desktop
+reader now captures the PDF tables as well as normalized Unicode text.
+`payroll_table_adapter.py` restores the previous table-cell path and parses
+separate earnings/deduction panes without treating employee header identifiers
+as financial accounts. `payroll_recovery.py` activates this fallback for employee records whose strict text parsing finds no items,
+provided the table adapter found candidates. Records already parsed semantically
+retain their original data and are never overwritten by recovered table guesses.
+All fallback values are **ReviewRequired**: no automatic verified amounts,
+no invented zero values and no payment authorizations.
+
+The GUI distinguishes three states: strict results, provisional table recovery
+and a true zero-data failure, including aggregate diagnostic counts (never
+personal identifiers) in the failure message. Regression tests use a fabricated
+two-column, visually reversed payslip with code/description/amount on separate
+lines. This does not certify every confidential Oracle layout.
+
 ## Operational accuracy caveat
 
 The included tests cover synthetic text, metadata boundaries, category separation, employer contributions, duplicate item warnings, official net checks, selected employee exports and readable XLSX values. This is *not proof* that pdfplumber text extraction exactly reproduces the user's original Oracle PDFs. On real local files, compare employee counts, identity fields, all ledger codes, printed totals and reconciliation warnings before relying on exports. Visual-order Arabic or image-only scans without a trustworthy text layer may require a separate extraction adapter and explicit manual review.
