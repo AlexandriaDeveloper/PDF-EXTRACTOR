@@ -42,6 +42,18 @@ class FakeOraclePage:
         return self._tables
 
 class RecoveryTests(unittest.TestCase):
+    def test_page_reader_collects_table_evidence_from_visual_arabic(self):
+        from oracle_payroll_extractor import parse_page
+        page=FakeOraclePage()
+        result=parse_page(page)
+        self.assertEqual(len(result["table_items"]),2)
+        self.assertIn("اسم الموظف",result["raw_text"])
+        self.assertIn("30200105-00001",result["raw_text"])
+        records,diag=recover_records([result])
+        self.assertTrue(diag["recovery_used"])
+        self.assertEqual(len(records),1)
+        self.assertEqual(len(records[0]["entries"]),2)
+
     def test_two_pane_tables_produce_two_separate_candidates(self):
         page=FakeOraclePage()
         rows=extract_table_candidates(page)
