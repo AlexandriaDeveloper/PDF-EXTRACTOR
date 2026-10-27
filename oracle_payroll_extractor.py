@@ -160,40 +160,32 @@ def extract_emp_info(text):
     return emp_name, emp_code
 
 def parse_page(page):
-    """Read page text only; grouping and item identification require document context."""
-    text = page.extract_text() or ""
-    # PDFium / pdfplumber may expose presentation-order Arabic lines reversed.
-    # Only decode when explicit Oracle labels/sections become more recognizable.
-    def semantic_score(value):
-        normalized = standard(value)
-        return sum(normalized.count(token) for token in (
-            "اسم الموظف", "رقم الصرف", "الاستحقاقات", "الاستقطاعات",
-            "الصافي", "الصافى", "حكومة", "اجمالي"))
-    visual="\n".join(decode_oracle_text(line) for line in text.splitlines())
-    if semantic_score(visual)>semantic_score(text):
-        text=visual
-    # Table extraction is a fallback when the page has no readable Unicode text.
-    # We do not infer financial values from numeric cells purely by their position.
-    if not text.strip():
-        rows = page.extract_tables() or []
-        text = "\n".join(" ".join(str(c or "") for c in row) for table in rows for row in table)
-    # Restore table evidence even if the flattened Unicode text contains
-    # recognizable headers; in Oracle's two-pane table financial cells often
-    # appear in *different physical text lines*.
-    table_items=extract_table_candidates(page)
-    # Legacy name/code heuristic is an identity hint only, never a verified ID.
-    header=""
+    """Read both Arabic text and Oracle's physical table cells in one pass."""
+    original=page.extract_text() or ""
     try:
         tables=page.extract_tables() or []
-        if tables and tables[0] and tables[0][0]:
-            header="\\n".join(str(c) for c in tables[0][0] if c)
     except Exception:
-        pass
-    old_name,old_code=extract_emp_info(header or page.extract_text() or "")
-    return {"raw_text": text, "page": page.page_number,
-            "table_items":table_items,"legacy_name":old_name,"legacy_code":old_code,
-            "text_chars":len(text)}
-
+        tables=[]
+    def semantic_score(value):
+        normalized=standard(value)
+        return sum(normalized.count(token) for token in (
+            "اسم الموظف","رقم الصرف","الاستحقاقات","الاستقطاعات",
+            "الصافي","الصافى","حكومة","اجمالي"))
+    visual="\n".join(decode_oracle_text(line) for line in original.splitlines())
+    text=visual if semantic_score(visual)>semantic_score(original) else original
+    if not text.strip():
+        text="\n".join(" ".join(str(c or "") for c in row)
+                       for table in tables for row in table)
+    table_items=extract_table_candidates(page,tables)
+    header=""
+    if tables and tables[0] and tables[0][0]:
+        header="\n".join(str(c) for c in tables[0][0] if c)
+    old_name,old_code=extract_emp_info(header or original)
+    return {
+        "raw_text":text,"page":page.page_number,"table_items":table_items,
+        "legacy_name":old_name,"legacy_code":old_code,
+        "text_chars":len(text),"table_count":len(tables)
+    }
 
 def parse_page_range(path, start, end):
     """تُنفذ داخل عملية منفصلة: تحليل مجموعة صفحات"""
