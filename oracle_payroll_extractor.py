@@ -12,6 +12,9 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import openpyxl
+from decimal import Decimal
+from payroll_core import parse_text_pages, standard, export_amount, EARNING, DEDUCTION, INFORMATIONAL
+from payroll_excel import create_excel
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
@@ -155,50 +158,25 @@ def extract_emp_info(text):
     return emp_name, emp_code
 
 def parse_page(page):
-    """تحليل صفحة واحدة: الاسم، الكود، وكل البنود {(القسم, البند): المبلغ}"""
-    tables = page.extract_tables()
+    """Read page text only; grouping and item identification require document context."""
+    text = page.extract_text() or ""
+    # PDFium / pdfplumber may expose presentation-order Arabic lines reversed.
+    # Only decode when explicit Oracle labels/sections become more recognizable.
+    def semantic_score(value):
+        normalized = standard(value)
+        return sum(normalized.count(token) for token in (
+            "اسم الموظف", "رقم الصرف", "الاستحقاقات", "الاستقطاعات",
+            "الصافي", "الصافى", "حكومة", "اجمالي"))
+    visual="\n".join(decode_oracle_text(line) for line in text.splitlines())
+    if semantic_score(visual)>semantic_score(text):
+        text=visual
+    # Table extraction is a fallback when the page has no readable Unicode text.
+    # We do not infer financial values from numeric cells purely by their position.
+    if not text.strip():
+        rows = page.extract_tables() or []
+        text = "\n".join(" ".join(str(c or "") for c in row) for table in rows for row in table)
+    return {"raw_text": text, "page": page.page_number}
 
-    # الترويسة (الاسم والكود) موجودة غالباً في أول خلية بالجدول - تغنينا عن extract_text المكلفة
-    header = ""
-    if tables and tables[0] and tables[0][0]:
-        header = "\n".join(str(c) for c in tables[0][0] if c)
-    emp_name, emp_code = extract_emp_info(header)
-    if emp_name == UNKNOWN or emp_code == UNKNOWN:
-        n2, c2 = extract_emp_info(page.extract_text() or "")
-        if emp_name == UNKNOWN: emp_name = n2
-        if emp_code == UNKNOWN: emp_code = c2
-
-    items = {}
-    for t in tables:
-        t_dec = decode_oracle_text(" ".join(str(c) for r in t for c in r if c))
-        is_deduc_table = ("الاستقطاعات" in t_dec) and ("الاستحقاقات" not in t_dec)
-        is_entit_table = ("الاستحقاقات" in t_dec)
-        for row in t:
-            if any(c and str(c).count("\n") > 3 for c in row):
-                continue
-            val_flags = [is_val(c) for c in row]
-            if not any(val_flags):
-                continue
-            for i, cell in enumerate(row):
-                if not cell or val_flags[i]:
-                    continue
-                raw_s = str(cell).strip()
-                if len(raw_s) < 3:
-                    continue
-                clean_s = decode_oracle_text(raw_s)
-                if not re.search(r'[\u0621-\u064A]', clean_s) or len(clean_s) < 3 or is_ignored_item(clean_s):
-                    continue
-                if is_deduc_table:
-                    cat = "الاستقطاعات"
-                elif is_entit_table:
-                    cat = "الاستقطاعات" if (len(row) > 6 and i < len(row) // 2) else "الاستحقاقات"
-                else:
-                    cat = "الاستقطاعات" if (len(row) <= 4 or i < len(row) // 2) else "الاستحقاقات"
-                amount = next((str(c).strip() for j, c in enumerate(row) if j != i and val_flags[j]), "")
-                if amount and (cat, clean_s) not in items:
-                    items[(cat, clean_s)] = parse_amount_to_float(amount)
-                break  # بند واحد لكل صف
-    return {"name": emp_name, "code": emp_code, "items": items}
 
 def parse_page_range(path, start, end):
     """تُنفذ داخل عملية منفصلة: تحليل مجموعة صفحات"""
@@ -220,6 +198,7 @@ class SmartPayrollApp:
         self.items_db = {"الاستقطاعات": [], "الاستحقاقات": []}
         self.pages_data = []
         self.current_export_info = None
+        self.parsed_employees = []
         self.msg_queue = queue.Queue()
         
         self.setup_ui()
@@ -419,10 +398,14 @@ class SmartPayrollApp:
     def _on_parse_done(self):
         """بناء قوائم البنود من البيانات المخزنة في الذاكرة"""
         items_set = {"الاستقطاعات": set(), "الاستحقاقات": set()}
-        for pg in self.pages_data:
-            for (cat, item) in pg["items"]:
+        self.parsed_employees = self.get_unified_employees(self.pages_data)
+        # Export is available immediately after document analysis; preview modes
+        # are optional and must never determine which employees are exported.
+        self.btn_xlsx.config(state=tk.NORMAL if self.parsed_employees else tk.DISABLED)
+        for emp in self.parsed_employees:
+            for (cat, account, label) in emp["items"]:
                 if cat in items_set:
-                    items_set[cat].add(item)
+                    items_set[cat].add(f"{account} | {label}")
         for cat in items_set:
             self.items_db[cat] = sorted(items_set[cat])
 
@@ -449,33 +432,12 @@ class SmartPayrollApp:
             self.combo_item.config(state="disabled")
 
     def get_unified_employees(self, pages_data):
-        """
-        توحيد بيانات الموظف:
-        1. دمج الصفحات الممتدة (Continuation Pages) التي لا تحتوي على ترويسة إلى الموظف السابق لها مباشرة.
-        2. دمج أي تكرار لنفس كود الموظف.
-        """
-        emps = []
-        curr_emp = None
-        for pg in pages_data:
-            is_cont = (pg.get("name") == UNKNOWN and pg.get("code") == UNKNOWN)
-            if not is_cont:
-                curr_emp = {
-                    "code": str(pg.get("code", "")).strip(),
-                    "name": str(pg.get("name", "")).strip(),
-                    "items": dict(pg.get("items", {}))
-                }
-                emps.append(curr_emp)
-            else:
-                if curr_emp is not None:
-                    curr_emp["items"].update(pg.get("items", {}))
-                else:
-                    curr_emp = {
-                        "code": UNKNOWN,
-                        "name": UNKNOWN,
-                        "items": dict(pg.get("items", {}))
-                    }
-                    emps.append(curr_emp)
-        return emps
+        """Build employees from the complete ordered text stream, not page-local guesses."""
+        records = parse_text_pages([p.get("raw_text", "") for p in pages_data])
+        for emp in records:
+            # Preserve the legacy display shape while retaining structured identity.
+            emp["display_items"] = {(kind, label): value for (kind, code, label), value in emp["items"].items()}
+        return records
 
     def fix_ar(self, t):
         if not t: return ""
@@ -493,7 +455,13 @@ class SmartPayrollApp:
         for i in self.tree.get_children():
             self.tree.delete(i)
 
-        unified_pages = self.get_unified_employees(self.pages_data)
+        unified_pages = getattr(self, "parsed_employees", None) or self.get_unified_employees(self.pages_data)
+        self.current_employees = unified_pages
+        def lookup(pg, cat, item):
+            matches = [(k, v) for k, v in pg["items"].items()
+                       if k[0] == cat and f"{k[1]} | {k[2]}" == item]
+            if not matches: return None if pg["status"] != "Verified" else Decimal(0)
+            return sum((v for _, v in matches), Decimal(0))
 
         if mode == "بند مالي واحد محدد":
             target_item = self.combo_item.get()
@@ -516,9 +484,9 @@ class SmartPayrollApp:
 
             results = []
             for pg in unified_pages:
-                amount_val = pg["items"].get(key)
+                amount_val = lookup(pg, category, target_item)
                 if amount_val is not None:
-                    amount_num = parse_amount_to_float(amount_val)
+                    amount_num = float(amount_val)
                     idx = len(results) + 1
                     self.tree.insert("", tk.END, values=(
                         idx,
@@ -577,9 +545,9 @@ class SmartPayrollApp:
                 row_vals = [idx, to_hindi_nums(pg["code"]), self.fix_ar(pg["name"])]
                 row_sum = 0.0
                 for itm in items_list:
-                    amt = pg["items"].get((cat_name, itm), 0.0)
-                    row_sum += amt
-                    row_vals.append(to_hindi_nums(f"{amt:,.2f}") if amt > 0 else "-")
+                    amt = lookup(pg, cat_name, itm)
+                    if amt is not None: row_sum += float(amt)
+                    row_vals.append(to_hindi_nums(f"{amt:,.2f}") if amt is not None else "غير متاح")
                 row_vals.append(to_hindi_nums(f"{row_sum:,.2f}"))
                 self.tree.insert("", tk.END, values=row_vals)
 
@@ -624,22 +592,23 @@ class SmartPayrollApp:
             self.tree.column("صافي الراتب", anchor=tk.E, width=140)
 
             for idx, pg in enumerate(unified_pages, start=1):
-                tot_ent = sum(pg["items"].get(("الاستحقاقات", itm), 0.0) for itm in ent_items)
-                tot_ded = sum(pg["items"].get(("الاستقطاعات", itm), 0.0) for itm in ded_items)
-                net = tot_ent - tot_ded
+                tot_ent = pg.get("printed_gross")
+                tot_ded = pg.get("printed_deductions")
+                net = pg.get("printed_net")
+                # Official Oracle totals are authoritative. Never fabricate a net amount.
 
                 row_vals = [idx, to_hindi_nums(pg["code"]), self.fix_ar(pg["name"])]
                 for itm in ent_items:
-                    amt = pg["items"].get(("الاستحقاقات", itm), 0.0)
-                    row_vals.append(to_hindi_nums(f"{amt:,.2f}") if amt > 0 else "-")
-                row_vals.append(to_hindi_nums(f"{tot_ent:,.2f}"))
+                    amt = lookup(pg, "الاستحقاقات", itm)
+                    row_vals.append(to_hindi_nums(f"{amt:,.2f}") if amt is not None else "غير متاح")
+                row_vals.append(to_hindi_nums(f"{tot_ent:,.2f}") if tot_ent is not None else "غير متاح")
 
                 for itm in ded_items:
-                    amt = pg["items"].get(("الاستقطاعات", itm), 0.0)
-                    row_vals.append(to_hindi_nums(f"{amt:,.2f}") if amt > 0 else "-")
-                row_vals.append(to_hindi_nums(f"{tot_ded:,.2f}"))
+                    amt = lookup(pg, "الاستقطاعات", itm)
+                    row_vals.append(to_hindi_nums(f"{amt:,.2f}") if amt is not None else "غير متاح")
+                row_vals.append(to_hindi_nums(f"{tot_ded:,.2f}") if tot_ded is not None else "غير متاح")
 
-                row_vals.append(to_hindi_nums(f"{net:,.2f}"))
+                row_vals.append(to_hindi_nums(f"{net:,.2f}") if net is not None else "غير متاح")
                 self.tree.insert("", tk.END, values=row_vals)
 
             self.current_export_info = {
@@ -652,565 +621,74 @@ class SmartPayrollApp:
             self.btn_xlsx.config(state=tk.NORMAL)
 
     def export(self):
-        """تصدير تقرير إكسيل احترافي بتنسيق مالي كامل ومحدد حسب النمط"""
-        if not self.current_export_info:
-            messagebox.showwarning("تنبيه", "لا توجد بيانات مستخرجة لتصديرها.")
+        """Interactive employee/item scope, without overwriting prior source records."""
+        if not getattr(self,"parsed_employees",None):
+            messagebox.showwarning("تنبيه","يجب مسح ملف يحتوي على موظفين أولًا")
             return
-
-        info = self.current_export_info
-        mode = info["mode"]
-        pdf_name = os.path.basename(self.pdf_path) if self.pdf_path else "ملف غير محدد"
-
-        if mode == "single":
-            safe_name = re.sub(r'[\\/*?:"<>|]', '_', info["target_item"]).strip()
-            default_file = f"كشف_{safe_name}.xlsx"
-            dialog_title = f"حفظ كشف {info['target_item']}"
-        elif mode == "category":
-            safe_name = "الاستحقاقات" if info["category"] == "الاستحقاقات" else "الاستقطاعات"
-            default_file = f"كشف_{safe_name}_كافة_الموظفين.xlsx"
-            dialog_title = f"حفظ كشف {info['category']}"
-        elif mode == "comprehensive":
-            default_file = "كشف_المرتبات_الشامل.xlsx"
-            dialog_title = "حفظ كشف المرتبات الشامل"
-        else:
-            default_file = "تقرير_الرواتب.xlsx"
-            dialog_title = "حفظ التقرير"
-
-        f = filedialog.asksaveasfilename(
-            title=dialog_title,
-            initialfile=default_file,
-            defaultextension=".xlsx",
-            filetypes=[("Excel", "*.xlsx")]
-        )
-        if not f:
-            return
-
-        try:
-            if mode == "single":
-                self._save_single_item_excel(f, info["data"], info["target_item"], info["category"], pdf_name)
-            elif mode == "category":
-                self._save_category_excel(f, info["data"], info["category"], info["items"], pdf_name)
-            elif mode == "comprehensive":
-                self._save_comprehensive_excel(f, info["data"], info["ent_items"], info["ded_items"], pdf_name)
-            
-            messagebox.showinfo("نجاح التصدير", f"تم تصدير ملف الإكسيل وتنسيقه باحترافية عالية:\n{os.path.basename(f)}")
-        except PermissionError:
-            messagebox.showerror(
-                "الملف مفتوح حالياً",
-                f"تعذر حفظ الملف لأن الملف مفتوح حالياً في برنامج آخر (مثل Excel):\n{os.path.basename(f)}\n\nيرجى إغلاق الملف في Excel ثم إعادة الضغط على تصدير."
-            )
-        except Exception as e:
-            messagebox.showerror("خطأ في التصدير", f"حدث خطأ أثناء تصدير الملف:\n{str(e)}")
-
-    def _save_single_item_excel(self, filepath, rows_data, target_item, category, pdf_name):
-        """تصدير تقرير إكسيل لبند واحد بتنسيق مالي أنيق واتجاه صفحة من اليمين لليسار"""
-        wb = openpyxl.Workbook()
-        ws = wb.active
-        ws.title = "كشف البند"
-        ws.views.sheetView[0].rightToLeft = True
-        ws.views.sheetView[0].showGridLines = True
-
-        c_navy_header = "1B365D"
-        c_navy_table  = "203764"
-        c_info_bar    = "E9EEF4"
-        c_zebra_odd   = "F2F6FB"
-        c_total_fill  = "D9E1F2"
-        c_border_gray = "D9D9D9"
-
-        side_thin = Side(style='thin', color=c_border_gray)
-        border_data = Border(left=side_thin, right=side_thin, top=side_thin, bottom=side_thin)
-
-        # 1. العنوان الرئيسي المدمج
-        ws.merge_cells('A1:D1')
-        title_cell = ws['A1']
-        title_cell.value = f"كشف استخراج: {target_item} ({category})"
-        title_cell.font = Font(name='Calibri', size=15, bold=True, color='FFFFFF')
-        title_cell.fill = PatternFill(start_color=c_navy_header, end_color=c_navy_header, fill_type='solid')
-        title_cell.alignment = Alignment(horizontal='center', vertical='center')
-        ws.row_dimensions[1].height = 36
-
-        # 2. شريط المعلومات والملخص
-        total_count = len(rows_data)
-        total_sum = sum(r["المبلغ"] for r in rows_data)
-
-        ws.merge_cells('A2:D2')
-        info_cell = ws['A2']
-        info_cell.value = f"الملف المصدر: {pdf_name}   |   إجمالي عدد الموظفين: {total_count:,}   |   إجمالي المبلغ: {total_sum:,.2f} ج.م"
-        info_cell.font = Font(name='Calibri', size=10, bold=True, color='1B365D')
-        info_cell.fill = PatternFill(start_color=c_info_bar, end_color=c_info_bar, fill_type='solid')
-        info_cell.alignment = Alignment(horizontal='center', vertical='center')
-        ws.row_dimensions[2].height = 22
-        ws.row_dimensions[3].height = 10
-
-        # 3. ترويسة الجدول
-        headers = ["م", "كود الموظف", "اسم الموظف", "المبلغ (ج.م)"]
-        for col_idx, h_text in enumerate(headers, start=1):
-            cell = ws.cell(row=4, column=col_idx, value=h_text)
-            cell.font = Font(name='Calibri', size=11, bold=True, color='FFFFFF')
-            cell.fill = PatternFill(start_color=c_navy_table, end_color=c_navy_table, fill_type='solid')
-            cell.alignment = Alignment(horizontal='center', vertical='center')
-            cell.border = Border(
-                left=side_thin, right=side_thin, top=side_thin,
-                bottom=Side(style='medium', color='142340')
-            )
-        ws.row_dimensions[4].height = 26
-
-        # 4. صفوف البيانات
-        for idx, row in enumerate(rows_data):
-            row_num = 5 + idx
-            fill_color = c_zebra_odd if idx % 2 == 1 else "FFFFFF"
-            row_fill = PatternFill(start_color=fill_color, end_color=fill_color, fill_type='solid')
-
-            # م
-            c_serial = ws.cell(row=row_num, column=1, value=idx + 1)
-            c_serial.alignment = Alignment(horizontal='center', vertical='center')
-            c_serial.fill = row_fill; c_serial.border = border_data
-
-            # كود الموظف نصي للحفاظ على الأصفار في البداية
-            c_code = ws.cell(row=row_num, column=2, value=str(row.get("كود الموظف", "")))
-            c_code.alignment = Alignment(horizontal='center', vertical='center')
-            c_code.fill = row_fill; c_code.border = border_data
-            c_code.number_format = '@'
-
-            # اسم الموظف
-            c_name = ws.cell(row=row_num, column=3, value=str(row.get("اسم الموظف", "")))
-            c_name.alignment = Alignment(horizontal='right', vertical='center')
-            c_name.fill = row_fill; c_name.border = border_data
-
-            # المبلغ
-            amt_val = parse_amount_to_float(row.get("المبلغ", 0.0))
-            c_amt = ws.cell(row=row_num, column=4, value=amt_val)
-            c_amt.alignment = Alignment(horizontal='right', vertical='center')
-            c_amt.fill = row_fill; c_amt.border = border_data
-            c_amt.number_format = '#,##0.00;(#,##0.00);"-"'
-
-            ws.row_dimensions[row_num].height = 22
-
-        # 5. صف الإجمالي الكلي المحاسبي
-        tot_row = 5 + total_count
-        tot_fill = PatternFill(start_color=c_total_fill, end_color=c_total_fill, fill_type='solid')
-        tot_border = Border(
-            top=Side(style='thin', color='203764'),
-            bottom=Side(style='double', color='203764'),
-            left=side_thin, right=side_thin
-        )
-
-        c1 = ws.cell(row=tot_row, column=1, value="")
-        c1.fill = tot_fill; c1.border = tot_border
-
-        c2 = ws.cell(row=tot_row, column=2, value=f"العدد: {total_count}")
-        c2.font = Font(name='Calibri', size=10, bold=True, color='203764')
-        c2.alignment = Alignment(horizontal='center', vertical='center')
-        c2.fill = tot_fill; c2.border = tot_border
-
-        c3 = ws.cell(row=tot_row, column=3, value="الإجمالي الكلي")
-        c3.font = Font(name='Calibri', size=11, bold=True, color='203764')
-        c3.alignment = Alignment(horizontal='right', vertical='center')
-        c3.fill = tot_fill; c3.border = tot_border
-
-        c4 = ws.cell(row=tot_row, column=4, value=f"=SUM(D5:D{tot_row - 1})")
-        c4.font = Font(name='Calibri', size=11, bold=True, color='203764')
-        c4.alignment = Alignment(horizontal='right', vertical='center')
-        c4.fill = tot_fill; c4.border = tot_border
-        c4.number_format = '#,##0.00;(#,##0.00);"-"'
-        ws.row_dimensions[tot_row].height = 28
-
-        # 6. ضبط عرض الأعمدة وتجميد الألواح
-        max_name_len = max([len(str(r.get("اسم الموظف", ""))) for r in rows_data] + [10]) if rows_data else 10
-        ws.column_dimensions['A'].width = 8
-        ws.column_dimensions['B'].width = 16
-        ws.column_dimensions['C'].width = max(max_name_len + 6, 32)
-        ws.column_dimensions['D'].width = 18
-
-        ws.freeze_panes = 'A5'
-        wb.save(filepath)
-
-    def _save_category_excel(self, filepath, pages_data, category, items_list, pdf_name):
-        """تصدير تقرير إكسيل لكافة بنود الاستحقاقات أو الاستقطاعات بالتفصيل والإجماليات"""
-        is_ent = (category == "الاستحقاقات")
-        title_text = "كشف تفصيلي لكافة بنود الاستحقاقات (المستحق)" if is_ent else "كشف تفصيلي لكافة بنود الاستقطاعات (المستقطع)"
-        sheet_title = "الاستحقاقات" if is_ent else "الاستقطاعات"
-
-        # ثيم الألوان
-        theme_banner = "1E5631" if is_ent else "781D29"
-        theme_header = "2D6A4F" if is_ent else "8A1C14"
-        theme_total_col = "1B4332" if is_ent else "5C1D24"
-        theme_info_bg = "E8F5E9" if is_ent else "FFE4E6"
-        theme_info_fg = "1E5631" if is_ent else "781D29"
-        theme_zebra = "F4FBF7" if is_ent else "FFF8F8"
-        theme_tot_row_bg = "C7E9C0" if is_ent else "F8D7DA"
-        theme_tot_border = "1E5631" if is_ent else "781D29"
-
-        c_border_gray = "D9D9D9"
-        side_thin = Side(style='thin', color=c_border_gray)
-        border_data = Border(left=side_thin, right=side_thin, top=side_thin, bottom=side_thin)
-
-        wb = openpyxl.Workbook()
-        ws = wb.active
-        ws.title = sheet_title
-        ws.views.sheetView[0].rightToLeft = True
-        ws.views.sheetView[0].showGridLines = True
-
-        m_items = len(items_list)
-        tot_col_idx = 4 + m_items
-        last_col_letter = get_column_letter(tot_col_idx)
-
-        # 1. العنوان المدمج
-        ws.merge_cells(f'A1:{last_col_letter}1')
-        t = ws['A1']
-        t.value = title_text
-        t.font = Font(name='Calibri', size=15, bold=True, color='FFFFFF')
-        t.fill = PatternFill(start_color=theme_banner, end_color=theme_banner, fill_type='solid')
-        t.alignment = Alignment(horizontal='center', vertical='center')
-        ws.row_dimensions[1].height = 36
-
-        # 2. شريط الملخص
-        total_count = len(pages_data)
-        ws.merge_cells(f'A2:{last_col_letter}2')
-        info = ws['A2']
-        info.value = f"الملف المصدر: {pdf_name}   |   إجمالي عدد الموظفين: {total_count:,}   |   عدد البنود المشمولة: {m_items}"
-        info.font = Font(name='Calibri', size=10, bold=True, color=theme_info_fg)
-        info.fill = PatternFill(start_color=theme_info_bg, end_color=theme_info_bg, fill_type='solid')
-        info.alignment = Alignment(horizontal='center', vertical='center')
-        ws.row_dimensions[2].height = 22
-        ws.row_dimensions[3].height = 10
-
-        # 3. ترويسة الجدول
-        headers = ["م", "كود الموظف", "اسم الموظف"] + items_list + [f"إجمالي {category}"]
-        for col_idx, h_text in enumerate(headers, start=1):
-            cell = ws.cell(row=4, column=col_idx, value=h_text)
-            cell.font = Font(name='Calibri', size=10, bold=True, color='FFFFFF')
-            bg = theme_total_col if col_idx == tot_col_idx else theme_header
-            cell.fill = PatternFill(start_color=bg, end_color=bg, fill_type='solid')
-            cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
-            cell.border = Border(left=side_thin, right=side_thin, top=side_thin, bottom=Side(style='medium', color='142340'))
-        ws.row_dimensions[4].height = 32
-
-        # 4. صفوف البيانات
-        for idx, pg in enumerate(pages_data):
-            row_num = 5 + idx
-            fill_color = theme_zebra if idx % 2 == 1 else "FFFFFF"
-            row_fill = PatternFill(start_color=fill_color, end_color=fill_color, fill_type='solid')
-
-            # م
-            c1 = ws.cell(row=row_num, column=1, value=idx + 1)
-            c1.alignment = Alignment(horizontal='center', vertical='center')
-            c1.fill = row_fill; c1.border = border_data
-
-            # كود الموظف نصي
-            c2 = ws.cell(row=row_num, column=2, value=str(pg["code"]))
-            c2.alignment = Alignment(horizontal='center', vertical='center')
-            c2.fill = row_fill; c2.border = border_data
-            c2.number_format = '@'
-
-            # اسم الموظف
-            c3 = ws.cell(row=row_num, column=3, value=str(pg["name"]))
-            c3.alignment = Alignment(horizontal='right', vertical='center')
-            c3.fill = row_fill; c3.border = border_data
-
-            # قيم البنود
-            for i_idx, itm in enumerate(items_list):
-                c_idx = 4 + i_idx
-                amt = pg["items"].get((category, itm), 0.0)
-                c = ws.cell(row=row_num, column=c_idx, value=amt)
-                c.alignment = Alignment(horizontal='right', vertical='center')
-                c.fill = row_fill; c.border = border_data
-                c.number_format = '#,##0.00;(#,##0.00);"-"'
-
-            # إجمالي الصف بمعادلة SUM
-            first_item_letter = get_column_letter(4)
-            last_item_letter = get_column_letter(3 + m_items)
-            c_tot = ws.cell(row=row_num, column=tot_col_idx, value=f"=SUM({first_item_letter}{row_num}:{last_item_letter}{row_num})")
-            c_tot.font = Font(name='Calibri', size=11, bold=True, color='000000')
-            c_tot.alignment = Alignment(horizontal='right', vertical='center')
-            c_tot.fill = row_fill; c_tot.border = border_data
-            c_tot.number_format = '#,##0.00;(#,##0.00);"-"'
-
-            ws.row_dimensions[row_num].height = 21
-
-        # 5. سطر الإجمالي الكلي المحاسبي
-        tot_row = 5 + total_count
-        tot_fill = PatternFill(start_color=theme_tot_row_bg, end_color=theme_tot_row_bg, fill_type='solid')
-        tot_border = Border(top=Side(style='thin', color=theme_tot_border), bottom=Side(style='double', color=theme_tot_border), left=side_thin, right=side_thin)
-
-        ws.cell(row=tot_row, column=1, value="").fill = tot_fill
-        ws.cell(row=tot_row, column=1).border = tot_border
-        c2 = ws.cell(row=tot_row, column=2, value=f"العدد: {total_count}")
-        c2.font = Font(name='Calibri', size=10, bold=True, color=theme_tot_border)
-        c2.alignment = Alignment(horizontal='center', vertical='center')
-        c2.fill = tot_fill; c2.border = tot_border
-
-        c3 = ws.cell(row=tot_row, column=3, value="الإجمالي الكلي")
-        c3.font = Font(name='Calibri', size=11, bold=True, color=theme_tot_border)
-        c3.alignment = Alignment(horizontal='right', vertical='center')
-        c3.fill = tot_fill; c3.border = tot_border
-
-        for c_idx in range(4, tot_col_idx + 1):
-            col_let = get_column_letter(c_idx)
-            c = ws.cell(row=tot_row, column=c_idx, value=f"=SUM({col_let}5:{col_let}{tot_row - 1})")
-            c.font = Font(name='Calibri', size=11, bold=True, color=theme_tot_border)
-            c.alignment = Alignment(horizontal='right', vertical='center')
-            c.fill = tot_fill; c.border = tot_border
-            c.number_format = '#,##0.00;(#,##0.00);"-"'
-
-        ws.row_dimensions[tot_row].height = 28
-
-        # 6. ضبط عروض الأعمدة وتجميد الألواح
-        ws.column_dimensions['A'].width = 8
-        ws.column_dimensions['B'].width = 16
-        ws.column_dimensions['C'].width = 34
-        for c_idx in range(4, tot_col_idx + 1):
-            ws.column_dimensions[get_column_letter(c_idx)].width = 17
-
-        ws.freeze_panes = 'D5'
-        wb.save(filepath)
-
-    def _save_comprehensive_excel(self, filepath, pages_data, ent_items, ded_items, pdf_name):
-        """تصدير الكشف الشامل: المستحق والمستقطع والصافي مع سوبر هيدر وتنسيق محاسبي متكامل"""
-        m = len(ent_items)
-        k = len(ded_items)
-        
-        tot_ent_col = 4 + m
-        first_ded_col = 5 + m
-        last_ded_item_col = 4 + m + k
-        tot_ded_col = 5 + m + k
-        net_col = 6 + m + k
-        last_col_letter = get_column_letter(net_col)
-
-        wb = openpyxl.Workbook()
-        ws = wb.active
-        ws.title = "الكشف الشامل"
-        ws.views.sheetView[0].rightToLeft = True
-        ws.views.sheetView[0].showGridLines = True
-
-        # لوحة الألوان الرسمية
-        c_emp_banner  = "1B365D"   # كحلي لبيانات الموظف
-        c_ent_banner  = "1E5631"   # أخضر داكن للاستحقاقات
-        c_ded_banner  = "781D29"   # نبيتي للاستقطاعات
-        c_net_banner  = "0F4C81"   # أزرق ملكي للصافي
-        
-        c_ent_sub     = "2D6A4F"
-        c_ded_sub     = "8A1C14"
-        c_ent_tot_sub = "143D28"
-        c_ded_tot_sub = "4A1218"
-        c_net_sub     = "092C48"
-
-        c_border_gray = "D9D9D9"
-        side_thin = Side(style='thin', color=c_border_gray)
-        border_data = Border(left=side_thin, right=side_thin, top=side_thin, bottom=side_thin)
-
-        # 1. العنوان الرئيسي
-        ws.merge_cells(f'A1:{last_col_letter}1')
-        t = ws['A1']
-        t.value = "كشف المرتبات والأجور الشامل (الاستحقاقات والاستقطاعات وصافي الراتب)"
-        t.font = Font(name='Calibri', size=15, bold=True, color='FFFFFF')
-        t.fill = PatternFill(start_color="142340", end_color="142340", fill_type='solid')
-        t.alignment = Alignment(horizontal='center', vertical='center')
-        ws.row_dimensions[1].height = 36
-
-        # 2. شريط الملخص
-        total_count = len(pages_data)
-        ws.merge_cells(f'A2:{last_col_letter}2')
-        info = ws['A2']
-        info.value = f"الملف المصدر: {pdf_name}   |   إجمالي عدد الموظفين: {total_count:,}   |   عدد بنود الاستحقاق: {m}   |   عدد بنود الاستقطاع: {k}"
-        info.font = Font(name='Calibri', size=10, bold=True, color='142340')
-        info.fill = PatternFill(start_color="E9EEF4", end_color="E9EEF4", fill_type='solid')
-        info.alignment = Alignment(horizontal='center', vertical='center')
-        ws.row_dimensions[2].height = 22
-        ws.row_dimensions[3].height = 10
-
-        # 3. السوبر هيدر (Super-Headers) في الصف 4
-        # بيانات الموظف (A4:C4)
-        ws.merge_cells('A4:C4')
-        c_emp = ws['A4']
-        c_emp.value = "بيانات الموظف الأساسية"
-        c_emp.font = Font(name='Calibri', size=11, bold=True, color='FFFFFF')
-        c_emp.fill = PatternFill(start_color=c_emp_banner, end_color=c_emp_banner, fill_type='solid')
-        c_emp.alignment = Alignment(horizontal='center', vertical='center')
-
-        # الاستحقاقات
-        ent_start_let = get_column_letter(4)
-        ent_end_let = get_column_letter(tot_ent_col)
-        ws.merge_cells(f'{ent_start_let}4:{ent_end_let}4')
-        c_ent = ws[f'{ent_start_let}4']
-        c_ent.value = "بنود الاستحقاقات (المستحق)"
-        c_ent.font = Font(name='Calibri', size=11, bold=True, color='FFFFFF')
-        c_ent.fill = PatternFill(start_color=c_ent_banner, end_color=c_ent_banner, fill_type='solid')
-        c_ent.alignment = Alignment(horizontal='center', vertical='center')
-
-        # الاستقطاعات
-        ded_start_let = get_column_letter(first_ded_col)
-        ded_end_let = get_column_letter(tot_ded_col)
-        ws.merge_cells(f'{ded_start_let}4:{ded_end_let}4')
-        c_ded = ws[f'{ded_start_let}4']
-        c_ded.value = "بنود الاستقطاعات (المستقطع)"
-        c_ded.font = Font(name='Calibri', size=11, bold=True, color='FFFFFF')
-        c_ded.fill = PatternFill(start_color=c_ded_banner, end_color=c_ded_banner, fill_type='solid')
-        c_ded.alignment = Alignment(horizontal='center', vertical='center')
-
-        # الصافي
-        net_let = get_column_letter(net_col)
-        c_net = ws[f'{net_let}4']
-        c_net.value = "صافي الراتب"
-        c_net.font = Font(name='Calibri', size=11, bold=True, color='FFFFFF')
-        c_net.fill = PatternFill(start_color=c_net_banner, end_color=c_net_banner, fill_type='solid')
-        c_net.alignment = Alignment(horizontal='center', vertical='center')
-
-        ws.row_dimensions[4].height = 24
-
-        # 4. أسماء الأعمدة الفردية (Sub-Headers) في الصف 5
-        headers_5 = [
-            ("م", "203764"),
-            ("كود الموظف", "203764"),
-            ("اسم الموظف", "203764")
-        ]
-        for itm in ent_items:
-            headers_5.append((itm, c_ent_sub))
-        headers_5.append(("إجمالي المستحق", c_ent_tot_sub))
-        for itm in ded_items:
-            headers_5.append((itm, c_ded_sub))
-        headers_5.append(("إجمالي المستقطع", c_ded_tot_sub))
-        headers_5.append(("صافي المبلغ المستحق", c_net_sub))
-
-        for c_idx, (h_title, h_color) in enumerate(headers_5, start=1):
-            cell = ws.cell(row=5, column=c_idx, value=h_title)
-            cell.font = Font(name='Calibri', size=10, bold=True, color='FFFFFF')
-            cell.fill = PatternFill(start_color=h_color, end_color=h_color, fill_type='solid')
-            cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
-            cell.border = Border(left=side_thin, right=side_thin, top=side_thin, bottom=Side(style='medium', color='142340'))
-        ws.row_dimensions[5].height = 32
-
-        # 5. صفوف البيانات
-        for idx, pg in enumerate(pages_data):
-            row_num = 6 + idx
-            fill_color = "F8FAFC" if idx % 2 == 1 else "FFFFFF"
-            row_fill = PatternFill(start_color=fill_color, end_color=fill_color, fill_type='solid')
-
-            # م
-            c1 = ws.cell(row=row_num, column=1, value=idx + 1)
-            c1.alignment = Alignment(horizontal='center', vertical='center')
-            c1.fill = row_fill; c1.border = border_data
-
-            # كود الموظف نصي
-            c2 = ws.cell(row=row_num, column=2, value=str(pg["code"]))
-            c2.alignment = Alignment(horizontal='center', vertical='center')
-            c2.fill = row_fill; c2.border = border_data
-            c2.number_format = '@'
-
-            # اسم الموظف
-            c3 = ws.cell(row=row_num, column=3, value=str(pg["name"]))
-            c3.alignment = Alignment(horizontal='right', vertical='center')
-            c3.fill = row_fill; c3.border = border_data
-
-            # مبالغ الاستحقاقات
-            for i_idx, itm in enumerate(ent_items):
-                c_idx = 4 + i_idx
-                amt = pg["items"].get(("الاستحقاقات", itm), 0.0)
-                c = ws.cell(row=row_num, column=c_idx, value=amt)
-                c.alignment = Alignment(horizontal='right', vertical='center')
-                c.fill = row_fill; c.border = border_data
-                c.number_format = '#,##0.00;(#,##0.00);"-"'
-
-            # معادلة إجمالي المستحق
-            ent_f_let = get_column_letter(4)
-            ent_l_let = get_column_letter(3 + m)
-            c_tot_ent = ws.cell(row=row_num, column=tot_ent_col, value=f"=SUM({ent_f_let}{row_num}:{ent_l_let}{row_num})")
-            c_tot_ent.font = Font(name='Calibri', size=10, bold=True, color='1E5631')
-            c_tot_ent.alignment = Alignment(horizontal='right', vertical='center')
-            c_tot_ent.fill = PatternFill(start_color="E8F5E9" if idx % 2 == 1 else "F1F8F2", end_color="E8F5E9", fill_type='solid')
-            c_tot_ent.border = border_data
-            c_tot_ent.number_format = '#,##0.00;(#,##0.00);"-"'
-
-            # مبالغ الاستقطاعات
-            for j_idx, itm in enumerate(ded_items):
-                c_idx = first_ded_col + j_idx
-                amt = pg["items"].get(("الاستقطاعات", itm), 0.0)
-                c = ws.cell(row=row_num, column=c_idx, value=amt)
-                c.alignment = Alignment(horizontal='right', vertical='center')
-                c.fill = row_fill; c.border = border_data
-                c.number_format = '#,##0.00;(#,##0.00);"-"'
-
-            # معادلة إجمالي الاستقطاع
-            ded_f_let = get_column_letter(first_ded_col)
-            ded_l_let = get_column_letter(last_ded_item_col)
-            c_tot_ded = ws.cell(row=row_num, column=tot_ded_col, value=f"=SUM({ded_f_let}{row_num}:{ded_l_let}{row_num})")
-            c_tot_ded.font = Font(name='Calibri', size=10, bold=True, color='781D29')
-            c_tot_ded.alignment = Alignment(horizontal='right', vertical='center')
-            c_tot_ded.fill = PatternFill(start_color="FFE4E6" if idx % 2 == 1 else "FFF1F2", end_color="FFE4E6", fill_type='solid')
-            c_tot_ded.border = border_data
-            c_tot_ded.number_format = '#,##0.00;(#,##0.00);"-"'
-
-            # معادلة الصافي: إجمالي المستحق - إجمالي المستقطع
-            tot_ent_let = get_column_letter(tot_ent_col)
-            tot_ded_let = get_column_letter(tot_ded_col)
-            c_net_val = ws.cell(row=row_num, column=net_col, value=f"={tot_ent_let}{row_num}-{tot_ded_let}{row_num}")
-            c_net_val.font = Font(name='Calibri', size=11, bold=True, color='0F4C81')
-            c_net_val.alignment = Alignment(horizontal='right', vertical='center')
-            c_net_val.fill = PatternFill(start_color="D9E1F2" if idx % 2 == 1 else "EBF1F5", end_color="D9E1F2", fill_type='solid')
-            c_net_val.border = border_data
-            c_net_val.number_format = '#,##0.00;(#,##0.00);"-"'
-
-            ws.row_dimensions[row_num].height = 21
-
-        # 6. صف الإجمالي الكلي المحاسبي في الأسفل
-        tot_row = 6 + total_count
-        tot_border = Border(top=Side(style='thin', color='142340'), bottom=Side(style='double', color='142340'), left=side_thin, right=side_thin)
-
-        # م
-        ws.cell(row=tot_row, column=1, value="").border = tot_border
-        ws.cell(row=tot_row, column=1).fill = PatternFill(start_color="E9EEF4", end_color="E9EEF4", fill_type='solid')
-
-        # كود
-        c2 = ws.cell(row=tot_row, column=2, value=f"العدد: {total_count}")
-        c2.font = Font(name='Calibri', size=10, bold=True, color='142340')
-        c2.alignment = Alignment(horizontal='center', vertical='center')
-        c2.fill = PatternFill(start_color="E9EEF4", end_color="E9EEF4", fill_type='solid')
-        c2.border = tot_border
-
-        # اسم
-        c3 = ws.cell(row=tot_row, column=3, value="الإجمالي الكلي")
-        c3.font = Font(name='Calibri', size=11, bold=True, color='142340')
-        c3.alignment = Alignment(horizontal='right', vertical='center')
-        c3.fill = PatternFill(start_color="E9EEF4", end_color="E9EEF4", fill_type='solid')
-        c3.border = tot_border
-
-        # مجاميع الأعمدة
-        for c_idx in range(4, net_col + 1):
-            col_let = get_column_letter(c_idx)
-            if c_idx < tot_ent_col:
-                bg_col = "C7E9C0"
-                fg_col = "1E5631"
-            elif c_idx == tot_ent_col:
-                bg_col = "A1D99B"
-                fg_col = "143D28"
-            elif c_idx < tot_ded_col:
-                bg_col = "F8D7DA"
-                fg_col = "781D29"
-            elif c_idx == tot_ded_col:
-                bg_col = "F1AEB5"
-                fg_col = "4A1218"
-            else: # Net
-                bg_col = "B8CCE4"
-                fg_col = "092C48"
-
-            c = ws.cell(row=tot_row, column=c_idx, value=f"=SUM({col_let}6:{col_let}{tot_row - 1})")
-            c.font = Font(name='Calibri', size=11, bold=True, color=fg_col)
-            c.alignment = Alignment(horizontal='right', vertical='center')
-            c.fill = PatternFill(start_color=bg_col, end_color=bg_col, fill_type='solid')
-            c.border = tot_border
-            c.number_format = '#,##0.00;(#,##0.00);"-"'
-
-        ws.row_dimensions[tot_row].height = 28
-
-        # 7. ضبط عروض الأعمدة وتجميد بيانات الموظف
-        ws.column_dimensions['A'].width = 8
-        ws.column_dimensions['B'].width = 16
-        ws.column_dimensions['C'].width = 34
-        for c_idx in range(4, net_col + 1):
-            ws.column_dimensions[get_column_letter(c_idx)].width = 17
-
-        ws.freeze_panes = 'D6'
-        wb.save(filepath)
+        employees=self.parsed_employees
+        popup=tk.Toplevel(self.root)
+        popup.title("اختيار الموظفين والبنود للتصدير")
+        popup.geometry("990x720")
+        popup.transient(self.root)
+        popup.grab_set()
+        area=tk.Frame(popup,padx=14,pady=12)
+        area.pack(fill=tk.BOTH,expand=True)
+        tk.Label(area,text="اختر موظفًا أو أكثر، وبندًا أو أكثر، أو الإجماليات الرسمية",font=("Segoe UI",12,"bold")).pack(anchor="e")
+        tk.Label(area,text="الموظفون (Ctrl/Shift للاختيار المتعدد، أو زر تحديد الكل)",font=("Segoe UI",10,"bold")).pack(anchor="e")
+        emp_frame=tk.Frame(area)
+        emp_frame.pack(fill=tk.BOTH,expand=True)
+        emp_scroll=tk.Scrollbar(emp_frame)
+        emp_scroll.pack(side=tk.LEFT,fill=tk.Y)
+        emp_list=tk.Listbox(emp_frame,selectmode=tk.EXTENDED,yscrollcommand=emp_scroll.set,
+                            font=("Segoe UI",10),exportselection=False)
+        emp_list.pack(side=tk.LEFT,fill=tk.BOTH,expand=True)
+        emp_scroll.config(command=emp_list.yview)
+        for e in employees:
+            emp_list.insert(tk.END,f"{e.get('name',UNKNOWN)}  |  {e.get('disbursement_number') or e.get('national_id') or 'غير معروف'}")
+        def select_all_employee():
+            emp_list.selection_set(0,tk.END)
+        tk.Button(area,text="تحديد كل الموظفين",command=select_all_employee).pack(anchor="e",pady=5)
+        select_all_employee()
+        flags=tk.Frame(area);flags.pack(fill=tk.X,pady=5)
+        gross=tk.BooleanVar(value=False)
+        deduction=tk.BooleanVar(value=False)
+        net=tk.BooleanVar(value=True)
+        for caption,var in (("إجمالي الاستحقاقات",gross),("إجمالي الاستقطاعات",deduction),("الصافي الرسمي",net)):
+            tk.Checkbutton(flags,text=caption,variable=var).pack(side=tk.RIGHT,padx=9)
+        tk.Label(area,text="بنود فردية (يمكن اختيار عدة بنود؛ Ctrl/Shift)",font=("Segoe UI",10,"bold")).pack(anchor="e")
+        available=sorted({k for e in employees for k in e["items"]},key=lambda x:(x[0],x[1],x[2]))
+        it_frame=tk.Frame(area);it_frame.pack(fill=tk.BOTH,expand=True)
+        it_scroll=tk.Scrollbar(it_frame);it_scroll.pack(side=tk.LEFT,fill=tk.Y)
+        it_list=tk.Listbox(it_frame,selectmode=tk.EXTENDED,yscrollcommand=it_scroll.set,
+                           font=("Segoe UI",10),exportselection=False)
+        it_list.pack(side=tk.LEFT,fill=tk.BOTH,expand=True)
+        it_scroll.config(command=it_list.yview)
+        for kind,code,label in available:it_list.insert(tk.END,f"{kind} | {code} | {label}")
+        tk.Button(area,text="تحديد جميع البنود",command=lambda:it_list.selection_set(0,tk.END)).pack(anchor="e",pady=4)
+        def save_selection():
+            indexes=list(emp_list.curselection())
+            item_indexes=list(it_list.curselection())
+            if not indexes:
+                messagebox.showwarning("تنبيه","حدد موظفًا واحدًا على الأقل",parent=popup)
+                return
+            if not (gross.get() or deduction.get() or net.get() or item_indexes):
+                messagebox.showwarning("تنبيه","حدد إجماليًا أو بندًا واحدًا على الأقل",parent=popup)
+                return
+            destination=filedialog.asksaveasfilename(parent=popup,defaultextension=".xlsx",
+                          filetypes=[("Excel",".xlsx")],initialfile="كشف_مرتبات_مخصص.xlsx")
+            if not destination:return
+            try:
+                result=create_excel(destination,employees,self.pdf_path,
+                    selected_indexes=indexes,
+                    selected_items=[available[i] for i in item_indexes],
+                    include_gross=gross.get(),include_deductions=deduction.get(),include_net=net.get())
+            except Exception as exc:
+                messagebox.showerror("خطأ تصدير",str(exc),parent=popup)
+                return
+            popup.destroy()
+            messagebox.showinfo("نجاح",f"تم تصدير {result['employees']} موظف و {result['details']} صف بند، مع {result['warnings']} تحذير مراجعة.")
+        tk.Button(area,text="تصدير Excel",command=save_selection,
+                  font=("Segoe UI",11,"bold"),bg="#2E7D32",fg="white").pack(fill=tk.X,pady=8)
 
 if __name__ == "__main__":
     multiprocessing.freeze_support()

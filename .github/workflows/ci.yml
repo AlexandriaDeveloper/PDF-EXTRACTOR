@@ -1,0 +1,35 @@
+name: Python source checks and Windows exe
+on:
+  push:
+    branches: [main, "feat/**"]
+  pull_request:
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -r requirements.txt
+      - run: python -m compileall -q oracle_payroll_extractor.py payroll_core.py payroll_excel.py
+      - run: python -m unittest discover -s tests -p "test_*.py" -v
+  build-windows:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -r requirements.txt pyinstaller
+      - run: pyinstaller --noconfirm --clean OraclePayrollExtractor.spec
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OraclePayrollExtractor-Windows
+          path: dist/OraclePayrollExtractor.exe
+          if-no-files-found: error
