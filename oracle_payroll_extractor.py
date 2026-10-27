@@ -410,7 +410,9 @@ class SmartPayrollApp:
         self.parsed_employees = self.get_unified_employees(self.pages_data)
         # Export is available immediately after document analysis; preview modes
         # are optional and must never determine which employees are exported.
-        self.btn_xlsx.config(state=tk.NORMAL if self.parsed_employees else tk.DISABLED)
+        meaningful=any(e.get("entries") or e.get("printed_net") is not None
+                       for e in self.parsed_employees)
+        self.btn_xlsx.config(state=tk.NORMAL if meaningful else tk.DISABLED)
         for emp in self.parsed_employees:
             for (cat, account, label) in emp["items"]:
                 if cat in items_set:
@@ -420,14 +422,47 @@ class SmartPayrollApp:
 
         total_pages = len(self.pages_data)
         total_items = len(self.items_db["الاستقطاعات"]) + len(self.items_db["الاستحقاقات"])
-        self.lbl_file.config(text=f"تم المسح: {os.path.basename(self.pdf_path)} ({total_pages} صفحة - {total_items} بند)", fg="green")
+        diagnostics=getattr(self,"last_parse_diagnostics",{})
+        candidates=diagnostics.get("table_candidates",0)
         self.combo_cat.set("الاستقطاعات")
         self.update_item_list()
         self.on_mode_change()
         if total_items == 0:
-            messagebox.showwarning("تنبيه", "لم يتم العثور على أي بنود. تأكد أن الملف يحتوي على جداول نصوص وليس صورا.")
+            self.lbl_file.config(
+                text=f"اكتمل فحص {total_pages} صفحة، ولكن لم يتعرف البرنامج على بنود قابلة للاستخراج",
+                fg="red"
+            )
+            messagebox.showwarning(
+                "لم ينجح استخراج البنود",
+                f"تمت قراءة {total_pages} صفحة؛ بنود النص: {diagnostics.get('semantic_items',0)}، "
+                f"صفوف الجداول المرشحة: {candidates}.\n"
+                "الملف ليس بالضرورة صورة. قد يكون تنسيق Oracle متعدد الأعمدة "
+                "أو نصًا عربيًا معكوس الترتيب. لم يتم إنشاء مبالغ افتراضية.\n"
+                "راجع إصدار التطبيق أو استخدم نسخة PDF النصية الأصلية.",
+            )
+        elif diagnostics.get("recovery_used"):
+            self.lbl_file.config(
+                text=f"قراءة جدولية احتياطية: {total_pages} صفحة، {total_items} بند — تحتاج مراجعة",
+                fg="darkorange"
+            )
+            messagebox.showwarning(
+                "استخراج أولي يحتاج مراجعة",
+                f"عُثر على {total_items} بند بالاستعانة بقراءة جداول Oracle.\n"
+                "هذه البيانات غير معتمدة بعد: راجع الموظفين وأكواد الحساب "
+                "وقيم الاستحقاقات والاستقطاعات والصافي مع أصل PDF قبل استخدامها.",
+            )
         else:
-            messagebox.showinfo("تم المسح بنجاح", f"تم العثور على {total_items} بند مالي مختلف ({len(self.items_db['الاستحقاقات'])} استحقاق و {len(self.items_db['الاستقطاعات'])} استقطاع).\nيمكنك الآن اختيار نمط الاستخراج المطلوب وعرضه أو تصديره فوراً.")
+            self.lbl_file.config(
+                text=f"تم المسح: {os.path.basename(self.pdf_path)} ({total_pages} صفحة - {total_items} بند)",
+                fg="green"
+            )
+            messagebox.showinfo(
+                "انتهى تحليل الملف",
+                f"تم العثور على {total_items} بند مختلف: "
+                f"{len(self.items_db['الاستحقاقات'])} استحقاق و"
+                f" {len(self.items_db['الاستقطاعات'])} استقطاع.\n"
+                "يُرجى مراجعة تحذيرات المطابقة داخل ملف Excel.",
+            )
 
     def update_item_list(self, event=None):
         cat = self.combo_cat.get()
