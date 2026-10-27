@@ -255,7 +255,8 @@ def parse_document(pages: list[dict]) -> tuple[list[dict],dict]:
     parsed=[]
     current=None
     diag={"pages":len(pages),"tabular_items":0,"tabular_verified":0,
-          "tabular_review":0,"tabular_recognized":False}
+          "tabular_review":0,"tabular_recognized":False,
+          "unrecognized_employee_headers":0}
     for index,page in enumerate(pages):
         raw = page.get("oracle_original_text","")
         tables = page.get("oracle_tables")
@@ -264,6 +265,14 @@ def parse_document(pages: list[dict]) -> tuple[list[dict],dict]:
             return [],diag
         evidence=extract_page(raw,tables or [],index+1)
         info=evidence["header"]
+        # Fail closed on a page that declares a new employee but whose
+        # labeled identity is incomplete. Otherwise its money could be
+        # silently attached to the *previous* employee.
+        visual_header=" ".join(logical(line) for line in raw.splitlines()[:18])
+        if info is None and "اسم الموظف" in key(visual_header) and "رقم الصرف" in key(visual_header):
+            diag["unrecognized_employee_headers"]+=1
+            current=None
+            continue
         if info:
             if current is None or (
                 current["disbursement_number"] != info["disbursement_number"] or
@@ -288,6 +297,11 @@ def parse_document(pages: list[dict]) -> tuple[list[dict],dict]:
     if not parsed or not any(employee["entries"] for employee in parsed):
         return [],diag
     diag["tabular_recognized"]=True
+    if diag["unrecognized_employee_headers"]:
+        for employee in parsed:
+            employee["warnings"].append(
+                "بعض رؤوس الموظفين لم يتم التعرف عليها؛ التقرير يحتاج مراجعة شاملة"
+            )
     ids=set()
     for employee in parsed:
         for entry in employee["entries"]:
