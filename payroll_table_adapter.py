@@ -86,10 +86,18 @@ def extract_table_candidates(page, tables=None) -> list[dict]:
             # Oracle payslips are typically a right/left two-pane table.
             # Prefer a 211/411 account prefix and use pane order only when
             # the account code is missing; never verify this inference.
-            if has_earn and has_deduct and len(row)>=4:
+            row_types={_kind_from_code(m.group()) for cell in row
+                       for m in DIGITS.finditer(cell)}
+            has_dual_codes=EARNING in row_types and DEDUCTION in row_types
+            if (has_earn and has_deduct or has_dual_codes) and len(row)>=4:
                 mid=len(row)//2
-                groups=[(DEDUCTION,row[:mid]),(EARNING,row[mid:])]
-            else:groups=[(EARNING if has_earn else DEDUCTION if has_deduct else None,row)]
+                # Account prefixes override physical left/right assumptions.
+                groups=[(None,row[:mid]),(None,row[mid:])]
+                if not has_dual_codes:
+                    groups=[(DEDUCTION,row[:mid]),(EARNING,row[mid:])]
+            else:
+                groups=[(EARNING if has_earn and not has_deduct else
+                         DEDUCTION if has_deduct and not has_earn else None,row)]
             for hinted_kind,cells in groups:
                 amounts=[(i,_financial_value(c)) for i,c in enumerate(cells)]
                 amounts=[(i,v) for i,v in amounts if v is not None]
