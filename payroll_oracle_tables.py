@@ -33,22 +33,30 @@ def canonical(text: object) -> str:
             .replace("\u200f", "").replace("\u200e", "").strip())
 
 def logical(raw: object) -> str:
-    """Undo presentation-order Arabic, but preserve monetary/ID digit runs."""
-    original = canonical(raw)
-    if not original:
-        return ""
-    if re.fullmatch(r"[-+\d\s,./%:]+", original):
+    """Select logical/visual Arabic order by evidence, never reverse by default."""
+    original=canonical(raw)
+    if not original or not ARABIC_LETTER.search(str(raw)):
         return original
-    restored = original[::-1]
-    restored = re.sub(
+    reversed_text=original[::-1]
+    reversed_text=re.sub(
         r"\d+(?:[.,/]\d+)*(?:-\d+)?",
-        lambda match: match.group()[::-1], restored
+        lambda match: match.group()[::-1],reversed_text
     )
-    restored = re.sub(
+    reversed_text=re.sub(
         r"\b[A-Za-z]{2,}\b",
-        lambda match: match.group()[::-1], restored
+        lambda match: match.group()[::-1],reversed_text
     )
-    return re.sub(r"\s+", " ", restored).strip()
+    # Glyphs in Unicode Arabic Presentation Forms are reliably visual order.
+    if re.search(r"[\uFB50-\uFDFF\uFE70-\uFEFF]",str(raw)):
+        return re.sub(r"\s+"," ",reversed_text).strip()
+    def score(candidate):
+        words=("اسم الموظف","رقم الصرف","الرقم القومي","الاستحقاقات",
+               "الاستقطاعات","اجمالي","الصافي","حكومة","مؤمن",
+               "بدل","حافز","علاوة","الاجر","شيخوخة","خصم","عمولة")
+        text=key(candidate)
+        return (sum(3 for word in words if key(word) in text)
+                +len(re.findall(r"\bال[ء-ي]{2,}",text)))
+    return reversed_text if score(reversed_text)>score(original) else original
 
 def key(text: object) -> str:
     result = canonical(text)
@@ -94,82 +102,110 @@ def parse_header(raw_text: str) -> dict | None:
         }
     return None
 
-def parse_row(row: list, table_index: int, page_number: int) -> list[dict]:
-    cells = [canonical(cell) for cell in row]
-    candidates=[]
-    for code_index, code in enumerate(cells):
-        account = account_code(code)
-        if account is None:
+def section_label(text: object) -> str | None:
+    normalized=key(logical(text))
+    if "اجمالي" in normalized:return None
+    if "الاستحقاقات" in normalized:return EARNING
+    if "الاستقطاعات" in normalized:return DEDUCTION
+    return None
+
+def summary_field(text: object) -> str | None:
+    normalized=key(logical(text))
+    if "اجمالي الاستحقاقات" in normalized:return "printed_gross"
+    if "اجمالي الاستقطاعات" in normalized:return "printed_deductions"
+    if "الصافي" in normalized or "صافى" in normalized:return "printed_net"
+    return None
+
+def infer_table_section(table: list, inherited: str | None = None) -> str | None:
+    """Use actual headings, or a table's official subtotal as evidence.
+
+    Unlike old code, neither the ordinal table number nor the number of
+    columns determines the kind. Conflicting headings remain unknown.
+    """
+    labels={section_label(cell) for row in table[:12] for cell in row if cell}
+    labels.discard(None)
+    if len(labels)==1:return next(iter(labels))
+    if len(labels)>1:return None
+    summaries=set()
+    for row in table:
+        for cell in row:
+            kind=summary_field(cell)
+            if kind=="printed_gross":summaries.add(EARNING)
+            elif kind=="printed_deductions":summaries.add(DEDUCTION)
+    if len(summaries)==1:return next(iter(summaries))
+    return inherited
+
+def parse_row(row: list, table_index: int, page_number: int,
+              section: str | None = None) -> list[dict]:
+    """Associate nearby financial cells with a code, not fixed coordinates.
+
+    Parameter table_index exists for legacy callers, but deliberately has
+    no influence on financial classification.
+    """
+    cells=[canonical(cell) for cell in row]
+    labels=[logical(cell) for cell in cells]
+    positions=[(i,account_code(cell)) for i,cell in enumerate(cells)
+               if account_code(cell)]
+    entries=[]
+    for ci,account in positions:
+        adjacent=[j for j in (ci-1,ci+1)
+                  if 0<=j<len(cells) and
+                  re.search("[ء-ي]",labels[j]) and
+                  summary_field(cells[j]) is None and
+                  section_label(cells[j]) is None]
+        if len(adjacent)!=1:continue
+        di=adjacent[0];label=labels[di]
+        normalized=key(label)
+        if (not re.search("[ء-ي]",label)
+            or normalized.startswith(("x ","× "))
+            or any(t in normalized for t in ("اجمالي","الصافي","الاسم"))):
             continue
-        # Both panes place [numeric amount][Arabic item label][account code]
-        # in separate cells. Do not infer a record from an arbitrary number.
-        descriptions = [
-            (j,c) for j,c in enumerate(cells[:code_index])
-            if ARABIC_LETTER.search(c)
-        ]
-        if not descriptions:
+        amounts=[(abs(j-di),j,parse_money(cell))
+                 for j,cell in enumerate(cells) if parse_money(cell) is not None]
+        # Exclude values belonging to a different code in the same physical row.
+        amounts=[x for x in amounts if x[0]<=2
+                 and all(abs(x[1]-other_index)>abs(di-other_index)
+                         for other_index,_ in positions if other_index!=ci)]
+        if not amounts:continue
+        amounts.sort(key=lambda x:(x[0],x[1]))
+        if len(amounts)>1 and amounts[0][0]==amounts[1][0]:
             continue
-        description_index, description = descriptions[-1]
-        if description_index != code_index-1:
-            continue
-        amounts = [
-            (j,parse_money(c)) for j,c in enumerate(cells[:description_index])
-            if parse_money(c) is not None
-        ]
-        if len(amounts) != 1:
-            continue
-        name = logical(description)
-        normalized = key(name)
-        if not re.search("[ء-ي]",name):
-            continue
-        if any(token in normalized for token in (
-            "اجمالي","الصافي","الاسم","الاستحقاقات","الاستقطاعات"
-        )) or normalized.startswith(("x","×")):
-            continue
-        # Table #0: credits, table #1: deductions, subsequent pages:
-        # employer contributions. Account prefix 11320129 is an actual
-        # deduction (collection commission); do not restrict to 211/411.
-        if table_index == 0 and account.startswith("2112") and "حكوم" in normalized:
-            kind = INFORMATIONAL
-        elif table_index >= 1:
-            kind = DEDUCTION
-        elif account.startswith("411"):
-            kind = DEDUCTION
-        else:
-            kind = EARNING
-        candidates.append({
-            "kind":kind,"account_code":account,"label":name,
-            "amount":amounts[0][1],"page":page_number,
-            "raw_text":logical(description)+" | "+account,
+        kind=(INFORMATIONAL if "حكوم" in normalized and section!=DEDUCTION
+              else section)
+        if kind not in (EARNING,DEDUCTION,INFORMATIONAL):continue
+        entries.append({
+            "kind":kind,"account_code":account,"label":label,
+            "amount":amounts[0][2],"page":page_number,
+            "raw_text":label+" | "+account,
         })
-    return candidates
+    return entries
 
 def parse_totals(row: list) -> dict[str,Decimal]:
     values={}
     cells=[canonical(cell) for cell in row]
     for i,cell in enumerate(cells):
-        normalized=key(logical(cell))
-        field=None
-        if "اجمالي الاستحقاقات" in normalized:
-            field="printed_gross"
-        elif "اجمالي الاستقطاعات" in normalized:
-            field="printed_deductions"
-        elif "الصافي" in normalized:
-            field="printed_net"
+        field=summary_field(cell)
         if field is None:continue
-        amounts=[parse_money(c) for j,c in enumerate(cells)
-                 if j!=i and parse_money(c) is not None]
+        amounts=[(abs(j-i),j,parse_money(other))
+                 for j,other in enumerate(cells)
+                 if j!=i and parse_money(other) is not None]
         if amounts:
-            values[field]=amounts[-1]
+            amounts.sort(key=lambda x:(x[0],x[1]))
+            if len(amounts)>1 and amounts[0][0]==amounts[1][0]:
+                continue
+            values[field]=amounts[0][2]
     return values
 
 def extract_page(raw_text: str, tables: list, page_number: int) -> dict:
-    entries=[]
-    totals={}
+    entries=[];totals={}
     for index,table in enumerate(tables or []):
+        section=infer_table_section(table)
         for row in table or []:
             if not row:continue
-            entries.extend(parse_row(row,index,page_number))
+            headings={section_label(cell) for cell in row if cell}
+            headings.discard(None)
+            if len(headings)==1:section=next(iter(headings))
+            entries.extend(parse_row(row,index,page_number,section))
             totals.update(parse_totals(row))
     return {"header":parse_header(raw_text),
             "entries":entries,"totals":totals,"page":page_number}
@@ -243,8 +279,9 @@ def parse_document(pages: list[dict]) -> tuple[list[dict],dict]:
                 employee["warnings"].append("الاستحقاقات لا تطابق الإجمالي الرسمي")
             if abs(amounts[DEDUCTION]-deduction)>epsilon:
                 employee["warnings"].append("الاستقطاعات لا تطابق الإجمالي الرسمي")
-            if abs(gross+amounts[INFORMATIONAL]-deduction-net)>epsilon:
-                employee["warnings"].append("الصافي لا يطابق استحقاقات وحصة الحكومة والاستقطاعات")
+            if (abs(gross+amounts[INFORMATIONAL]-deduction-net)>epsilon
+                and abs(gross-deduction-net)>epsilon):
+                employee["warnings"].append("الصافي لا يطابق الإجماليات أو حصة الحكومة")
         if not employee["entries"]:
             employee["warnings"].append("لم يتم استخراج بنود مالية")
         employee["status"]="ReviewRequired" if employee["warnings"] else "Verified"
