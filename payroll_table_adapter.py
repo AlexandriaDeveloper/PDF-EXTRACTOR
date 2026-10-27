@@ -75,7 +75,8 @@ def extract_table_candidates(page, tables=None) -> list[dict]:
         try: tables=page.extract_tables() or []
         except Exception:return []
     candidates=[]
-    for table in tables:
+    covered_rows=set()
+    for table_number,table in enumerate(tables):
         if not table:continue
         normalized=[[cell_text(c) if c is not None else "" for c in row] for row in table if row]
         joined=" ".join(" ".join(row) for row in normalized[:4])
@@ -124,13 +125,13 @@ def extract_table_candidates(page, tables=None) -> list[dict]:
                     "raw_text":" | ".join(c for c in cells if c),
                     "source":"legacy-table","row":row_index+1
                 })
+                covered_rows.add((table_number,row_index+1))
     # Compatibility with the previously working parser: Oracle table extraction
     # sometimes places the account, description and amount into *different*
     # cells, with mixed left/right panes and columns missing code values.
     # A strict candidate can be empty in this situation; restore those rows
     # as explicit REVIEW-only entries rather than returning zero for the file.
-    if not candidates:
-        for table in tables:
+    for table_number,table in enumerate(tables):
             if not table:continue
             rows=[[cell_text(c) if c is not None else "" for c in row]
                   for row in table if row]
@@ -138,6 +139,7 @@ def extract_table_candidates(page, tables=None) -> list[dict]:
             earnings=key(EARNING) in key(whole)
             deductions=key(DEDUCTION) in key(whole)
             for index,row in enumerate(rows):
+                if (table_number,index+1) in covered_rows:continue
                 if not row or any(cell.count("\n")>3 for cell in row):continue
                 numeric=[(i,_financial_value(c)) for i,c in enumerate(row)]
                 numeric=[(i,v) for i,v in numeric if v is not None]
