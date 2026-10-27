@@ -17,6 +17,7 @@ from payroll_core import parse_text_pages, standard, export_amount, EARNING, DED
 from payroll_excel import create_excel
 from payroll_table_adapter import extract_table_candidates
 from payroll_recovery import recover_records
+from payroll_oracle_tables import parse_document as parse_oracle_document
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
@@ -184,7 +185,10 @@ def parse_page(page):
     return {
         "raw_text":text,"page":page.page_number,"table_items":table_items,
         "legacy_name":old_name,"legacy_code":old_code,
-        "text_chars":len(text),"table_count":len(tables)
+        "text_chars":len(text),"table_count":len(tables),
+        # Preserve the visual-order text and physical cell boundaries:
+        # flattening them was the source of the zero-item regression.
+        "oracle_original_text":original,"oracle_tables":tables
     }
 
 def parse_page_range(path, start, end):
@@ -427,6 +431,8 @@ class SmartPayrollApp:
         self.combo_cat.set("الاستقطاعات")
         self.update_item_list()
         self.on_mode_change()
+        verified_count=sum(e.get("status")=="Verified" for e in self.parsed_employees)
+        review_count=len(self.parsed_employees)-verified_count
         if total_items == 0:
             self.lbl_file.config(
                 text=f"اكتمل فحص {total_pages} صفحة، ولكن لم يتعرف البرنامج على بنود قابلة للاستخراج",
@@ -453,14 +459,15 @@ class SmartPayrollApp:
             )
         else:
             self.lbl_file.config(
-                text=f"تم المسح: {os.path.basename(self.pdf_path)} ({total_pages} صفحة - {total_items} بند)",
-                fg="green"
+                text=f"تم المسح: {total_pages} صفحة - {total_items} بند - {verified_count} موظف متحقق - {review_count} للمراجعة",
+                fg="green" if review_count==0 else "darkorange"
             )
             messagebox.showinfo(
                 "انتهى تحليل الملف",
                 f"تم العثور على {total_items} بند مختلف: "
                 f"{len(self.items_db['الاستحقاقات'])} استحقاق و"
                 f" {len(self.items_db['الاستقطاعات'])} استقطاع.\n"
+                f"الموظفون المتحقق منهم: {verified_count}، يحتاجون مراجعة: {review_count}.\n"
                 "يُرجى مراجعة تحذيرات المطابقة داخل ملف Excel.",
             )
 
@@ -477,7 +484,17 @@ class SmartPayrollApp:
 
     def get_unified_employees(self, pages_data):
         """Review-safe Oracle extraction, with the previous table format restored."""
-        records,diagnostics=recover_records(pages_data)
+        # Try the financially verified Oracle table reader first.
+        # Other PDF layouts retain the conservative semantic/legacy fallback.
+        records,proof=parse_oracle_document(pages_data)
+        if records:
+            diagnostics={**proof,
+                "semantic_items":proof["tabular_items"],
+                "table_candidates":proof["tabular_items"],
+                "text_pages":sum(bool(p.get("text_chars")) for p in pages_data),
+                "recovery_used":False}
+        else:
+            records,diagnostics=recover_records(pages_data)
         self.last_parse_diagnostics=diagnostics
         for employee in records:
             employee["display_items"]={
