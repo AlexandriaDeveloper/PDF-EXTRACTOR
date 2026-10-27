@@ -23,8 +23,7 @@ of this algorithm was run locally against the user-provided original
 October 2026 payslip PDF containing **438 pages and 219 employees**.
 All 219 national IDs were unique, all 219 records had printed gross,
 deductions, and net, all 219 records reconciled their item totals and
-government-share equation with no discrepancies. The official net sum
-was **2,864,042.24 EGP**. CI uses invented test identities only; no real
+government-share equation with no discrepancies. CI uses invented test identities only; no real
 employee name, national ID, salary row, original PDF, or debug trace is
 included in the repository. A different 386-page PDF must be validated
 separately rather than assumed equivalent.
