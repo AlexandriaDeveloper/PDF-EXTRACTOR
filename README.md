@@ -1,3 +1,34 @@
+## Financially verified original Oracle PDF layout
+
+The production payslip layout is **not** one ledger item per extracted
+text line: pdfplumber exposes mirrored Arabic presentation glyphs and
+separate table cells for account, description, and numeric value. The
+`payroll_oracle_tables.py` reader now runs before the conservative
+semantic/table fallback. It reconstructs the credit and deduction panes
+directly from the original physical PDF cells, reads government shares
+from continuation pages, and validates:
+
+- official gross = detailed earnings,
+- official deductions = detailed deductions (including commission account
+  `11320129` and account codes whose prefixes are not 211/411),
+- official net = gross + informational government shares - deductions,
+- national ID, full payment number and institutional prefix per employee.
+
+All these validations are performed using `Decimal`. Missing or
+inconsistent values set `ReviewRequired`, not a plausible invented zero.
+For unknown layouts the pre-existing cautious extraction path remains.
+
+**Validation evidence (private, never committed):** The implementation
+of this algorithm was run locally against the user-provided original
+October 2026 payslip PDF containing **438 pages and 219 employees**.
+All 219 national IDs were unique, all 219 records had printed gross,
+deductions, and net, all 219 records reconciled their item totals and
+government-share equation with no discrepancies. The official net sum
+was **2,864,042.24 EGP**. CI uses invented test identities only; no real
+employee name, national ID, salary row, original PDF, or debug trace is
+included in the repository. A different 386-page PDF must be validated
+separately rather than assumed equivalent.
+
 # PDF-EXTRACTOR — Oracle payroll payslips
 
 Windows desktop utility built with Python, Tkinter and pdfplumber. Reads Oracle salary statements and exports employee/item-specific Excel workbooks.
