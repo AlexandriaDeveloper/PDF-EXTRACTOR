@@ -5,7 +5,7 @@ Every case uses wholly synthetic identities and amounts, not actual payslips.
 import copy
 import unittest
 from decimal import Decimal
-from payroll_oracle_tables import parse_document
+from payroll_oracle_tables import parse_document,extract_page
 from test_verified_oracle_tables import first_page,second_page,mirror
 
 def reformat(*,swapped=False,wide=False,reverse_cells=False,plain_arabic=False,
@@ -91,6 +91,20 @@ class LayoutMatrixTests(unittest.TestCase):
         emp=self.verified(reformat(govt_deduction=True))
         row=next(e for e in emp['entries'] if e['account_code']=="11320129")
         self.assertEqual(row['kind'],'الاستقطاعات')
+    def test_mixed_earnings_and_deductions_in_single_physical_table(self):
+        header=("اسم الموظف: موظف اختباري رقم الصرف: 30200105-00001 "
+                "الرقم القومي: 00000000000001")
+        table=[
+            ["",mirror("الاستقطاعات"),None,None,
+             "",mirror("الاستحقاقات"),None,None],
+            ["20.00",mirror("خصم تجريبي"),"76543210","",
+             "100.00",mirror("بدل الجامعة"),"98765432",""]
+        ]
+        page=extract_page(mirror(header),[table],1)
+        self.assertEqual(len(page["entries"]),2)
+        items={(x["account_code"],x["kind"],x["amount"]) for x in page["entries"]}
+        self.assertIn(("76543210","الاستقطاعات",Decimal('20')),items)
+        self.assertIn(("98765432","الاستحقاقات",Decimal('100')),items)
     def test_bad_total_remains_review(self):
         pages=reformat(codes=True,swapped=True)
         pages[1]['oracle_tables'][0][1][1]="119.00"
