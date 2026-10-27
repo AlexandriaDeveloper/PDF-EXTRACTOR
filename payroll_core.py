@@ -43,6 +43,9 @@ def amount(text: object) -> Decimal | None:
     s=standard(text).replace(",","").strip()
     if not DECIMAL_AMOUNT.fullmatch(s):
         return None
+    if "." not in s and len(s.lstrip("-")) in (8, 14):
+        # Identifier-shaped integers must not be treated as cash amounts.
+        return None
     try: return Decimal(s)
     except InvalidOperation: return None
 
