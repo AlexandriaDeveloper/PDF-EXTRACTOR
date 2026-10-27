@@ -34,8 +34,9 @@ version consequently scanned every page yet produced zero items. The desktop
 reader now captures the PDF tables as well as normalized Unicode text.
 `payroll_table_adapter.py` restores the previous table-cell path and parses
 separate earnings/deduction panes without treating employee header identifiers
-as financial accounts. `payroll_recovery.py` activates this fallback only if
-the strict parser finds no item but the PDF table adapter has candidates.
+as financial accounts. `payroll_recovery.py` activates this fallback for employee records whose strict text parsing finds no items,
+provided the table adapter found candidates. Records already parsed semantically
+retain their original data and are never overwritten by recovered table guesses.
 All fallback values are **ReviewRequired**: no automatic verified amounts,
 no invented zero values and no payment authorizations.
 
