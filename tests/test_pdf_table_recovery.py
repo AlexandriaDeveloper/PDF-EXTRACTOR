@@ -6,7 +6,7 @@ import unittest
 from decimal import Decimal
 from payroll_table_adapter import extract_table_candidates, reverse_visual
 from payroll_recovery import recover_records
-from payroll_core import EARNING, DEDUCTION, INFORMATIONAL, UNKNOWN
+from payroll_core import EARNING, DEDUCTION, INFORMATIONAL, UNKNOWN, identifier
 
 def visual(text):
     # Reversed glyph order with number runs restored to represent pdfplumber's
@@ -98,6 +98,17 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(records[0]["pages"],[1])
         self.assertEqual(records[1]["pages"],[2])
         self.assertNotEqual(records[0]["national_id"],records[1]["national_id"])
+    def test_reversed_payment_number_is_restored_as_institutional_prefix(self):
+        info=identifier(
+            "اسم الموظف: موظف اختباري "
+            "رقم الصرف: 00001-30200105 "
+            "الرقم القومي: 00000000000001"
+        )
+        self.assertEqual(info["disbursement_number"],"30200105-00001")
+        self.assertEqual(info["institutional_code"],"30200105")
+        self.assertEqual(info["code"],"00001")
+        self.assertEqual(info["national_id"],"00000000000001")
+
     def test_empty_pdf_keeps_zero_and_never_claims_success(self):
         result,diagnostics=recover_records([
             {"raw_text":"Document without payslip data","table_items":[],
