@@ -399,6 +399,9 @@ class SmartPayrollApp:
         """بناء قوائم البنود من البيانات المخزنة في الذاكرة"""
         items_set = {"الاستقطاعات": set(), "الاستحقاقات": set()}
         self.parsed_employees = self.get_unified_employees(self.pages_data)
+        # Export is available immediately after document analysis; preview modes
+        # are optional and must never determine which employees are exported.
+        self.btn_xlsx.config(state=tk.NORMAL if self.parsed_employees else tk.DISABLED)
         for emp in self.parsed_employees:
             for (cat, account, label) in emp["items"]:
                 if cat in items_set:
