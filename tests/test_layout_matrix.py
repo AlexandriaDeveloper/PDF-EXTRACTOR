@@ -91,6 +91,17 @@ class LayoutMatrixTests(unittest.TestCase):
         emp=self.verified(reformat(govt_deduction=True))
         row=next(e for e in emp['entries'] if e['account_code']=="11320129")
         self.assertEqual(row['kind'],'الاستقطاعات')
+    def test_separate_header_lines_do_not_require_one_specific_print_layout(self):
+        pages=reformat()
+        pages[0]["oracle_original_text"]=(
+            mirror("نظام الرواتب")+"\n"
+            +mirror("اسم الموظف: موظف اختباري")+"\n"
+            +mirror("رقم الصرف: 30200105-00001")+"\n"
+            +mirror("الرقم القومي: 00000000000001")
+        )
+        employee=self.verified(pages)
+        self.assertEqual(employee["disbursement_number"],"30200105-00001")
+
     def test_mixed_earnings_and_deductions_in_single_physical_table(self):
         header=("اسم الموظف: موظف اختباري رقم الصرف: 30200105-00001 "
                 "الرقم القومي: 00000000000001")
