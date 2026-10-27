@@ -15,6 +15,7 @@ import openpyxl
 from decimal import Decimal
 from payroll_core import parse_text_pages, standard, export_amount, EARNING, DEDUCTION, INFORMATIONAL
 from payroll_excel import create_excel
+from payroll_table_adapter import extract_table_candidates
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
@@ -175,7 +176,22 @@ def parse_page(page):
     if not text.strip():
         rows = page.extract_tables() or []
         text = "\n".join(" ".join(str(c or "") for c in row) for table in rows for row in table)
-    return {"raw_text": text, "page": page.page_number}
+    # Restore table evidence even if the flattened Unicode text contains
+    # recognizable headers; in Oracle's two-pane table financial cells often
+    # appear in *different physical text lines*.
+    table_items=extract_table_candidates(page)
+    # Legacy name/code heuristic is an identity hint only, never a verified ID.
+    header=""
+    try:
+        tables=page.extract_tables() or []
+        if tables and tables[0] and tables[0][0]:
+            header="\\n".join(str(c) for c in tables[0][0] if c)
+    except Exception:
+        pass
+    old_name,old_code=extract_emp_info(header or page.extract_text() or "")
+    return {"raw_text": text, "page": page.page_number,
+            "table_items":table_items,"legacy_name":old_name,"legacy_code":old_code,
+            "text_chars":len(text)}
 
 
 def parse_page_range(path, start, end):
@@ -432,12 +448,78 @@ class SmartPayrollApp:
             self.combo_item.config(state="disabled")
 
     def get_unified_employees(self, pages_data):
-        """Build employees from the complete ordered text stream, not page-local guesses."""
-        records = parse_text_pages([p.get("raw_text", "") for p in pages_data])
-        for emp in records:
-            # Preserve the legacy display shape while retaining structured identity.
-            emp["display_items"] = {(kind, label): value for (kind, code, label), value in emp["items"].items()}
-        return records
+        """Prefer strict semantic extraction; guarded table recovery if it yields none."""
+        records=parse_text_pages([p.get("raw_text","") for p in pages_data])
+        strong=sum(len(e["entries"]) for e in records)
+        table_count=sum(len(p.get("table_items",[])) for p in pages_data)
+        self.last_parse_diagnostics={
+            "pages":len(pages_data),"semantic_items":strong,
+            "table_candidates":table_count,
+            "text_pages":sum(1 for p in pages_data if p.get("text_chars",0)>0),
+            "recovery_used":False
+        }
+        if strong or not table_count:
+            for emp in records:
+                emp["display_items"]={(kind,label):value
+                    for (kind,code,label),value in emp["items"].items()}
+            return records
+
+        self.last_parse_diagnostics["recovery_used"]=True
+        recovered=[]
+        current=None
+        for page_number,page in enumerate(pages_data,1):
+            text=page.get("raw_text","")
+            info=identifier(text)
+            old_name=page.get("legacy_name",UNKNOWN)
+            old_code=page.get("legacy_code",UNKNOWN)
+            if info["name"]==UNKNOWN and old_name!=UNKNOWN:
+                info["name"]=old_name
+            if info["code"]==UNKNOWN and old_code!=UNKNOWN:
+                info["code"]=old_code
+            evidence=(
+                info.get("national_id")
+                or info.get("disbursement_number")
+                or (info.get("name") if info.get("name")!=UNKNOWN else None)
+                or (info.get("code") if info.get("code")!=UNKNOWN else None))
+            current_id=None if current is None else (
+                current.get("national_id") or current.get("disbursement_number")
+                or (current.get("name") if current.get("name")!=UNKNOWN else None)
+                or (current.get("code") if current.get("code")!=UNKNOWN else None))
+            open_new=(current is None or (evidence and current_id and evidence!=current_id)
+                       or (evidence and not current_id))
+            if open_new and (evidence or page.get("table_items")):
+                current={**info,"items":{},"entries":[],"warnings":[
+                    "استعادة جدولية احتياطية: البنود تحتاج مراجعة مع ملف Oracle الأصلي"
+                ],"pages":[],"printed_gross":None,"printed_deductions":None,
+                    "printed_net":None,"status":"ReviewRequired"}
+                recovered.append(current)
+            if current is None:continue
+            if page_number not in current["pages"]:current["pages"].append(page_number)
+            for item in page.get("table_items",[]):
+                item_key=(item["kind"],item["account_code"],item["label"])
+                value=item["amount"]
+                if item_key in current["items"]:
+                    current["warnings"].append("تكرار بند من الجداول يحتاج مراجعة")
+                current["items"][item_key]=current["items"].get(item_key,Decimal(0))+value
+                current["entries"].append({
+                    "kind":item["kind"],"account_code":item["account_code"],
+                    "label":item["label"],"amount":value,"page":page_number,
+                    "raw_text":item["raw_text"]
+                })
+                if not item["account_code"]:
+                    current["warnings"].append("بند بدون كود حساب مثبت في صفحة "+str(page_number))
+            # Printed amounts are not fabricated from partial recovered rows.
+            # Keep them NULL when the strict semantic parser could not prove them.
+        for emp in recovered:
+            if not emp["entries"]:
+                emp["warnings"].append("لم يتم استخلاص أي بند مالي موثوق")
+            if emp.get("national_id") is None:
+                emp["warnings"].append("الرقم القومي لم يتم إثباته")
+            if emp.get("disbursement_number") is None:
+                emp["warnings"].append("رقم الصرف الكامل غير مثبت")
+            emp["display_items"]={(kind,label):value
+                for (kind,code,label),value in emp["items"].items()}
+        return recovered
 
     def fix_ar(self, t):
         if not t: return ""
