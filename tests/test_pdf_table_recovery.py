@@ -62,6 +62,18 @@ class RecoveryTests(unittest.TestCase):
         self.assertIn((EARNING,"21110442",Decimal("100.00")),keys)
         self.assertIn((DEDUCTION,"41110201",Decimal("40.00")),keys)
         self.assertTrue(all(r["account_code"]!="30200105" for r in rows))
+    def test_two_pane_items_without_section_heading_in_same_table(self):
+        page=FakeOraclePage()
+        page._tables=[
+            [[visual(page.heading)]],
+            [[visual("41110201"),visual("خصم اختباري"),"40.00",
+              visual("21110442"),visual("بدل الجامعة"),"100.00"]]
+        ]
+        items=extract_table_candidates(page)
+        self.assertEqual(len(items),2)
+        self.assertEqual({x["account_code"] for x in items},{"21110442","41110201"})
+        self.assertEqual({x["kind"] for x in items},{EARNING,DEDUCTION})
+
     def test_semantic_zero_is_recovered_as_explicit_review(self):
         page=FakeOraclePage()
         # text deliberately contains split code/label/amount lines. The strict
