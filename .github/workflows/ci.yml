@@ -1,7 +1,7 @@
 name: Python source checks and Windows exe
 on:
   push:
-    branches: [main, "feat/**", "fix/**"]
+    branches: [main, "feat/**", "fix/**", "refactor/**"]
   pull_request:
 jobs:
   test:
