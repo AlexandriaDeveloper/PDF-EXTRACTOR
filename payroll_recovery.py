@@ -17,9 +17,8 @@ def recover_records(pages: list[dict]) -> tuple[list[dict],dict]:
         "text_pages":sum(bool(p.get("text_chars",0)) for p in pages),
         "recovery_used":False
     }
-    if semantic_items or not table_items:
+    if not table_items:
         return strict,diagnostics
-    diagnostics["recovery_used"]=True
     recovered=[]
     current=None
 
@@ -94,4 +93,50 @@ def recover_records(pages: list[dict]) -> tuple[list[dict],dict]:
             employee["warnings"].append("رقم الصرف الكامل غير مثبت")
         # Do not declare recovered items Verified or infer missing as zero.
         employee["status"]="ReviewRequired"
-    return recovered,diagnostics
+    if not semantic_items:
+        diagnostics["recovery_used"]=bool(recovered)
+        return recovered,diagnostics
+
+    # Some employees can be parsed semantically while others have visually
+    # interleaved accounts. Apply table recovery *only* to employees for whom
+    # the primary parser found no entries, and do not duplicate the good ones.
+    def identity_match(a,b):
+        for field in ("national_id","disbursement_number"):
+            if has(a.get(field)) and has(b.get(field)) and a[field]==b[field]:
+                return True
+        return False
+
+    result=[]
+    consumed=set()
+    for original in strict:
+        matches=[(i,fallback) for i,fallback in enumerate(recovered)
+                 if i not in consumed and (
+                     identity_match(original,fallback) or
+                     (not has(original.get("national_id")) and
+                      not has(original.get("disbursement_number")) and
+                      set(original.get("pages",[])) & set(fallback.get("pages",[])))
+                 )]
+        if original.get("entries") or not matches:
+            result.append(original)
+            # Block duplicate recovered rows for an already parsed employee.
+            if original.get("entries"):
+                consumed.update(i for i,_ in matches)
+            continue
+        i,candidate=matches[0]
+        consumed.add(i)
+        if not candidate.get("entries"):
+            result.append(original)
+            continue
+        for field in ("printed_gross","printed_deductions","printed_net"):
+            if original.get(field) is not None:candidate[field]=original[field]
+        diagnostics["recovery_used"]=True
+        result.append(candidate)
+    for i,candidate in enumerate(recovered):
+        if i in consumed or not candidate.get("entries"):
+            continue
+        if any(identity_match(existing,candidate) for existing in result):
+            continue
+        diagnostics["recovery_used"]=True
+        result.append(candidate)
+    result.sort(key=lambda e:min(e.get("pages",[10**9])))
+    return result,diagnostics
