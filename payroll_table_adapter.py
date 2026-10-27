@@ -69,10 +69,11 @@ def _is_description(s: str) -> bool:
     if s.lstrip().lower().startswith(("x ","× ")):return False
     return True
 
-def extract_table_candidates(page) -> list[dict]:
+def extract_table_candidates(page, tables=None) -> list[dict]:
     """Best-effort table rows; all results are explicitly *unverified*."""
-    try: tables=page.extract_tables() or []
-    except Exception:return []
+    if tables is None:
+        try: tables=page.extract_tables() or []
+        except Exception:return []
     candidates=[]
     for table in tables:
         if not table:continue
@@ -115,6 +116,50 @@ def extract_table_candidates(page) -> list[dict]:
                     "raw_text":" | ".join(c for c in cells if c),
                     "source":"legacy-table","row":row_index+1
                 })
+    # Compatibility with the previously working parser: Oracle table extraction
+    # sometimes places the account, description and amount into *different*
+    # cells, with mixed left/right panes and columns missing code values.
+    # A strict candidate can be empty in this situation; restore those rows
+    # as explicit REVIEW-only entries rather than returning zero for the file.
+    if not candidates:
+        for table in tables:
+            if not table:continue
+            rows=[[cell_text(c) if c is not None else "" for c in row]
+                  for row in table if row]
+            whole=" ".join(" ".join(row) for row in rows)
+            earnings=key(EARNING) in key(whole)
+            deductions=key(DEDUCTION) in key(whole)
+            for index,row in enumerate(rows):
+                if not row or any(cell.count("\n")>3 for cell in row):continue
+                numeric=[(i,_financial_value(c)) for i,c in enumerate(row)]
+                numeric=[(i,v) for i,v in numeric if v is not None]
+                if not numeric:continue
+                for position,desc in enumerate(row):
+                    if not _is_description(desc) or any(i==position for i,_ in numeric):
+                        continue
+                    if len(row)>1:
+                        if earnings and not deductions:kind=EARNING
+                        elif deductions and not earnings:kind=DEDUCTION
+                        elif earnings and deductions:
+                            kind=DEDUCTION if position < len(row)//2 else EARNING
+                        else:
+                            kind=DEDUCTION if len(row)<=4 or position<len(row)//2 else EARNING
+                    else:continue
+                    code=next((m.group() for cell in row
+                               for m in DIGITS.finditer(cell)
+                               if m.group().startswith(("211","411"))), "")
+                    if code.startswith("211"):kind=EARNING
+                    elif code.startswith("411"):kind=DEDUCTION
+                    if "حكوم" in key(desc):kind=INFORMATIONAL
+                    value=numeric[0][1]
+                    candidates.append({
+                        "kind":kind,"account_code":code,"label":desc,
+                        "amount":value,"raw_text":" | ".join(c for c in row if c),
+                        "source":"legacy-table","row":index+1
+                    })
+                    # Match the legacy rule: a single safely-reviewable
+                    # description/value link per physical table row.
+                    break
     # Deduplicate exact table representations (some pages return nested overlapping tables)
     seen=set()
     unique=[]
